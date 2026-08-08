@@ -22,7 +22,7 @@ from daily_dashboard import DailyDiagnosisDashboard
 from smart_metering import SmartMeteringService, long_to_wide
 
 
-WEB_ROOT = ROOT / "web"
+FRONTEND_ROOT = ROOT / "frontend" / "dist"
 EQUIPMENT_INDEX = ROOT / "agent_inputs" / "equipment_health" / "index.json"
 EQUIPMENT_USERS = ROOT / "agent_inputs" / "equipment_health" / "users"
 INPUT_DB = ROOT / "database" / "gas_ai_input.duckdb"
@@ -419,10 +419,16 @@ def inspect(request: InspectionRequest):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-if WEB_ROOT.exists():
-    app.mount("/static", StaticFiles(directory=str(WEB_ROOT)), name="static")
+if FRONTEND_ROOT.exists():
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_ROOT)), name="static")
 
 
 @app.get("/", include_in_schema=False)
 def index():
-    return FileResponse(WEB_ROOT / "index.html")
+    index_file = FRONTEND_ROOT / "index.html"
+    if not index_file.exists():
+        raise HTTPException(
+            status_code=503,
+            detail="React 前端尚未构建，请先执行 pnpm --dir frontend build",
+        )
+    return FileResponse(index_file)

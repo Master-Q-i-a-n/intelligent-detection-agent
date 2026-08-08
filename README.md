@@ -140,6 +140,52 @@ uv run python .\metering_cli.py `
 
 添加 `--no-model` 可在不加载深度模型时只执行规则、基线和量程分析。
 
+### React 前端与启动方式
+
+前端已迁移为 React + TypeScript + Vite，并使用 ECharts 绘制所有业务图表。首次使用先安装前端依赖：
+
+```powershell
+pnpm --dir frontend install
+```
+
+开发模式需要在两个终端中分别显式启动（项目不会自动启动服务）：
+
+```powershell
+# 终端 1：FastAPI
+.\start_api.ps1
+
+# 终端 2：Vite 开发服务器
+pnpm --dir frontend dev
+```
+
+开发页面地址为 `http://127.0.0.1:5173/`，Vite 会将 `/api`、`/daily`、`/metering`、
+`/equipment`、`/agent` 等请求代理到 `http://127.0.0.1:8000`。
+
+生产模式先构建前端，再显式启动 FastAPI：
+
+```powershell
+pnpm --dir frontend build
+.\start_api.ps1
+```
+
+构建结果位于 `frontend/dist`，FastAPI 从该目录提供首页和 `/static` 静态资源，生产页面地址为
+`http://127.0.0.1:8000/`。
+
+侧栏“Agent 自动解读”开关每次打开页面都默认为关闭且不持久化。关闭时不会自动调用
+`/agent/inspect`，但详情页的“生成智能检查结果”按钮仍会按用户操作调用；开启后会按
+`模块 + 企业 + 日期` 对当前详情自动调用一次。
+
+前端检查命令：
+
+```powershell
+pnpm --dir frontend typecheck
+pnpm --dir frontend test
+pnpm --dir frontend build
+
+# 视觉测试要求开发页面已经由用户显式启动
+pnpm --dir frontend test:e2e
+```
+
 ### 启动API
 
 ```powershell
@@ -163,7 +209,7 @@ uv sync
 - 补气量为算法估算值，必须经过现场核查和企业计量规则确认后才能用于结算。
 # 工业AI双模块可视化与检查 Agent
 
-启动 API 后访问 `http://127.0.0.1:8000/`，即可进入“曜衡智控”工业风智能检测平台。页面包含：
+生产构建完成并启动 API 后访问 `http://127.0.0.1:8000/`，即可进入“曜衡智控”工业风智能检测平台。页面包含：
 
 - 智能计量：用气量与正常基线、补气量构成、综合风险、表具量程适配、管路数据完整度、异常区间及工单证据。
 - 智能设备：19 日健康指数、H0-H4 五阶段概率、三轴振动波形、轴向/形态学尺度权重、状态演化及每日诊断明细。
@@ -174,6 +220,8 @@ Windows 启动方式：
 ```powershell
 cd E:\MyWork\Agent\intelligent-detection-agent
 uv sync
+pnpm --dir frontend install
+pnpm --dir frontend build
 .\start_api.ps1
 ```
 

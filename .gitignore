@@ -24,6 +24,14 @@ dist/
 *.egg-info/
 .eggs/
 
+# React / Vite / Playwright
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+frontend/.vite/
+frontend/coverage/
+
 # uv / Python 工具缓存（uv.lock 应提交）
 .uv-cache/
 .python-version.local
