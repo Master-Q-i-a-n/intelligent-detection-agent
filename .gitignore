@@ -40,6 +40,8 @@ logs/
 *.swp
 
 # 本项目生成的数据、数据库、模型和 Agent 输入
+source_data/
+source_vibration/
 dataset/
 database/*.duckdb
 database/*.duckdb.wal

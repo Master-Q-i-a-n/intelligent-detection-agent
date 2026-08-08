@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-import sys
+import os
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
@@ -11,9 +11,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "runtime_libs"))
-LEGACY_ROOT = Path(r"D:\hf_make\找工作\燃气\闫赛\代码\Websocket")
-sys.path.insert(1, str(LEGACY_ROOT))
 
 import duckdb  # noqa: E402
 import numpy as np  # noqa: E402
@@ -24,7 +21,9 @@ from data_analyse import DataQualityAnalyzer  # noqa: E402
 
 INPUT_DB = ROOT / "database" / "gas_ai_input.duckdb"
 RESULT_DB = ROOT / "database" / "gas_ai_results.duckdb"
-MODEL_PATH = LEGACY_ROOT / "best_model_xiugai_new.pth"
+MODEL_PATH = Path(
+    os.getenv("METERING_MODEL_PATH", str(ROOT / "models" / "metering" / "best_model_xiugai_new.pth"))
+)
 
 
 @dataclass

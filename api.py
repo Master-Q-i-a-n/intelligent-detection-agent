@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import sys
 import threading
 from datetime import date, datetime
 from pathlib import Path
@@ -10,7 +9,6 @@ from typing import Any, Dict, List, Optional
 
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "runtime_libs"))
 
 import duckdb
 import numpy as np
@@ -28,6 +26,39 @@ WEB_ROOT = ROOT / "web"
 EQUIPMENT_INDEX = ROOT / "agent_inputs" / "equipment_health" / "index.json"
 EQUIPMENT_USERS = ROOT / "agent_inputs" / "equipment_health" / "users"
 INPUT_DB = ROOT / "database" / "gas_ai_input.duckdb"
+
+
+def _refresh_parquet_views() -> None:
+    """启动时将 DuckDB 视图重新绑定到当前项目目录，支持项目整体移动。"""
+    telemetry_glob = (ROOT / "dataset" / "telemetry" / "observation_date=*" / "*.parquet").as_posix()
+    vibration_glob = (ROOT / "dataset" / "vibration" / "observation_date=*" / "*.parquet").as_posix()
+    with duckdb.connect(str(INPUT_DB)) as con:
+        con.execute(
+            f"""
+            CREATE OR REPLACE VIEW telemetry.scada_observation AS
+            SELECT *, CAST(observation_date AS DATE) AS data_date
+            FROM read_parquet('{telemetry_glob}', hive_partitioning=1)
+            """
+        )
+        con.execute(
+            f"""
+            CREATE OR REPLACE VIEW vibration.acceleration_window AS
+            SELECT *, CAST(observation_date AS DATE) AS data_date
+            FROM read_parquet('{vibration_glob}', hive_partitioning=1)
+            """
+        )
+        con.execute(
+            """
+            CREATE OR REPLACE VIEW vibration.daily_health AS
+            SELECT window_id,user_id,company_name,meter_id,sensor_id,data_date,
+                   operating_condition,coarse_label,stage_label,stage_name,health_index,
+                   trend_label,trajectory_type,trajectory_name,label_source,is_synthetic
+            FROM vibration.acceleration_window
+            """
+        )
+
+
+_refresh_parquet_views()
 
 app = FastAPI(title="燃气计量与设备健康智能检测平台", version="1.0.0")
 service = SmartMeteringService(use_deep_model=True)

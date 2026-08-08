@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import shutil
-import sys
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -12,8 +12,6 @@ from typing import Iterable, Optional
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-RUNTIME_LIBS = PROJECT_ROOT / "runtime_libs"
-sys.path.insert(0, str(RUNTIME_LIBS))
 
 import duckdb  # noqa: E402
 import numpy as np  # noqa: E402
@@ -22,7 +20,7 @@ import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
 
-SOURCE_ROOT = Path(r"D:\hf_make\找工作\燃气\数据")
+SOURCE_ROOT = Path(os.getenv("GAS_SOURCE_ROOT", str(PROJECT_ROOT / "source_data")))
 DB_PATH = PROJECT_ROOT / "database" / "gas_ai_input.duckdb"
 PARQUET_ROOT = PROJECT_ROOT / "dataset" / "telemetry"
 SCHEMA_PATH = PROJECT_ROOT / "schema.sql"

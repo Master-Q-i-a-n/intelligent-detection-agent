@@ -4,15 +4,14 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import shutil
-import sys
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "runtime_libs"))
 
 import duckdb  # noqa: E402
 import numpy as np  # noqa: E402
@@ -21,8 +20,10 @@ import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
 
-FLOW_ROOT = Path(r"D:\hf_make\找工作\燃气\数据")
-VIBRATION_SOURCE_ROOT = Path(r"D:\hf_make\找工作\燃气\燃气健康状态评估交接内容\数据整理")
+FLOW_ROOT = Path(os.getenv("GAS_SOURCE_ROOT", str(ROOT / "source_data")))
+VIBRATION_SOURCE_ROOT = Path(
+    os.getenv("GAS_VIBRATION_SOURCE_ROOT", str(ROOT / "source_vibration"))
+)
 DB_PATH = ROOT / "database" / "gas_ai_input.duckdb"
 SCHEMA_PATH = ROOT / "schema.sql"
 PARQUET_ROOT = ROOT / "dataset" / "vibration"

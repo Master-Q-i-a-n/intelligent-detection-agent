@@ -4,7 +4,6 @@ import hashlib
 import json
 import math
 import random
-import sys
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -12,7 +11,6 @@ from typing import Optional
 
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "runtime_libs"))
 
 import duckdb  # noqa: E402
 import numpy as np  # noqa: E402

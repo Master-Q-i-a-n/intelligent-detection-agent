@@ -22,12 +22,15 @@ Agent友好的每日健康状态查询。该数据由工程师三分类样本派
 
 ## 构建命令
 
+仅在需要从原始文件重建数据库时设置数据源目录：
+
 ```powershell
-$env:PYTHONPATH='D:\hf_make\找工作\燃气\智能检测Agent\runtime_libs'
-& 'D:\Anaconda3\python.exe' '.\build_database.py' --mode master
-& 'D:\Anaconda3\python.exe' '.\build_database.py' --mode scada --overwrite
-& 'D:\Anaconda3\python.exe' '.\build_vibration_database.py' --overwrite
-& 'D:\Anaconda3\python.exe' '.\validate_vibration_database.py'
+$env:GAS_SOURCE_ROOT='D:\path\to\gas-source-data'
+$env:GAS_VIBRATION_SOURCE_ROOT='D:\path\to\vibration-source-data'
+uv run python .\build_database.py --mode master
+uv run python .\build_database.py --mode scada --overwrite
+uv run python .\build_vibration_database.py --overwrite
+uv run python .\validate_vibration_database.py
 ```
 
 ## 智能设备振动数据
@@ -57,31 +60,30 @@ $env:PYTHONPATH='D:\hf_make\找工作\燃气\智能检测Agent\runtime_libs'
 训练命令：
 
 ```powershell
-$env:PYTHONPATH='D:\hf_make\找工作\燃气\智能检测Agent\runtime_libs'
-& 'D:\Anaconda3\python.exe' '.\equipment_cli.py' train --epochs 20 --batch-size 256
+uv run python .\equipment_cli.py train --epochs 20 --batch-size 256
 ```
 
 单日诊断和趋势诊断：
 
 ```powershell
-& 'D:\Anaconda3\python.exe' '.\equipment_cli.py' diagnose `
+uv run python .\equipment_cli.py diagnose `
   --user-id 1071586391 --date 2025-01-12
 
-& 'D:\Anaconda3\python.exe' '.\equipment_cli.py' trend `
+uv run python .\equipment_cli.py trend `
   --user-id 1071586391 --start 2024-12-25 --end 2025-01-12
 ```
 
 算法复验：
 
 ```powershell
-& 'D:\Anaconda3\python.exe' '.\validate_equipment_algorithm.py'
+uv run python .\validate_equipment_algorithm.py
 ```
 
 生成全部715家企业的Agent输入JSON：
 
 ```powershell
-& 'D:\Anaconda3\python.exe' '.\equipment_cli.py' export-agent-inputs
-& 'D:\Anaconda3\python.exe' '.\validate_equipment_agent_inputs.py'
+uv run python .\equipment_cli.py export-agent-inputs
+uv run python .\validate_equipment_agent_inputs.py
 ```
 
 Agent输入位于 `agent_inputs/equipment_health`：`index.json` 是用户索引，
@@ -130,8 +132,7 @@ Agent输入位于 `agent_inputs/equipment_health`：`index.json` 是用户索引
 ### 命令行诊断
 
 ```powershell
-$env:PYTHONPATH='D:\hf_make\找工作\燃气\智能检测Agent\runtime_libs'
-& 'D:\Anaconda3\python.exe' '.\metering_cli.py' `
+uv run python .\metering_cli.py `
   --user-id 2267475 `
   --date 2025-01-12 `
   --output '.\reports\diagnosis_2267475_2025-01-12.json'
@@ -142,6 +143,7 @@ $env:PYTHONPATH='D:\hf_make\找工作\燃气\智能检测Agent\runtime_libs'
 ### 启动API
 
 ```powershell
+uv sync
 .\start_api.ps1
 ```
 
@@ -170,7 +172,8 @@ $env:PYTHONPATH='D:\hf_make\找工作\燃气\智能检测Agent\runtime_libs'
 Windows 启动方式：
 
 ```powershell
-cd D:\hf_make\找工作\燃气\智能检测Agent
+cd E:\MyWork\Agent\intelligent-detection-agent
+uv sync
 .\start_api.ps1
 ```
 
