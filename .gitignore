@@ -1,0 +1,62 @@
+# 本地环境和密钥
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# Python 缓存、测试和覆盖率产物
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# 构建和打包产物
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# uv / Python 工具缓存（uv.lock 应提交）
+.uv-cache/
+.python-version.local
+
+# 旧版随项目复制的第三方运行库，改由 .venv 管理
+runtime_libs/
+
+# 日志和临时文件
+logs/
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+
+# 本项目生成的数据、数据库、模型和 Agent 输入
+dataset/
+database/*.duckdb
+database/*.duckdb.wal
+models/**/*.pt
+models/**/*.pth
+agent_inputs/
+
+# 运行和验证报告
+reports/
+
+# 编辑器和操作系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+database/
+dataset/
+models/

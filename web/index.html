@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>曜衡智控 · 燃气AI智能检测平台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">YH</span><div><b>曜衡智控</b><small>GAS AI INSPECTION</small></div></div>
+      <div class="system-label">智能检测中心</div>
+      <button class="nav-item active" data-page="overview"><span>00</span><div>每日巡检总览<small>Daily Inspection</small></div></button>
+      <button class="nav-item" data-page="metering"><span>01</span><div>智能计量详情<small>Metering Evidence</small></div></button>
+      <button class="nav-item" data-page="equipment"><span>02</span><div>智能设备详情<small>Equipment Evidence</small></div></button>
+      <div class="side-status"><i></i><div><b>系统运行正常</b><small>算法服务 / 数据库 / Agent</small></div></div>
+    </aside>
+
+    <main>
+      <header>
+        <div><p class="eyebrow">5G + MULTIMODAL AI</p><h1>燃气计量与设备健康智能检测平台</h1></div>
+        <div class="header-actions">
+          <label id="userLabel" class="detail-only">当前企业<select id="userSelect"></select></label>
+          <label>检测日期<select id="dateSelect"></select></label>
+          <button id="refreshButton" class="primary">执行每日全量诊断</button>
+        </div>
+      </header>
+
+      <div id="notice" class="notice hidden"></div>
+
+      <section id="overviewPage" class="page active">
+        <div class="section-heading"><div><p class="eyebrow">DAILY AUTONOMOUS INSPECTION</p><h2>每日全量自诊断</h2></div><span id="overviewStatus" class="status-chip">等待执行</span></div>
+        <div class="kpi-grid" id="overviewKpis"></div>
+        <div class="dashboard-grid overview-grid">
+          <article class="panel"><div class="panel-title"><div><b>问题模块分布</b><small>智能计量 / 智能设备</small></div></div><canvas id="moduleChart" height="220"></canvas></article>
+          <article class="panel"><div class="panel-title"><div><b>风险等级分布</b><small>按问题事件统计</small></div></div><div id="riskDistribution" class="bar-list"></div></article>
+          <article class="panel"><div class="panel-title"><div><b>问题类型排行</b><small>高频异常自动聚合</small></div></div><div id="issueTypeRanking" class="bar-list"></div></article>
+          <article class="panel span-3"><div class="panel-title"><div><b>异常企业清单</b><small>仅展示存在问题的企业；点击记录查看当天结果、近7天动态指标和证据链</small></div><div class="table-tools"><input id="issueSearch" placeholder="搜索企业 / 编号 / 问题"><select id="moduleFilter"><option value="all">全部模块</option><option value="metering">智能计量</option><option value="equipment">智能设备</option></select><select id="riskFilter"><option value="all">全部风险</option><option>严重</option><option>高</option><option>中</option><option>较低</option></select></div></div><div class="table-wrap issue-table-wrap"><table><thead><tr><th>风险</th><th>企业</th><th>问题模块</th><th>主要问题</th><th>问题证据摘要</th><th>关键指标</th><th>操作</th></tr></thead><tbody id="issueTable"></tbody></table></div></article>
+        </div>
+      </section>
+
+      <section id="meteringPage" class="page">
+        <div class="section-heading"><div><p class="eyebrow">SMART METERING</p><h2>智能计量诊断</h2></div><span id="meteringStatus" class="status-chip">等待检测</span></div>
+        <div class="kpi-grid" id="meteringKpis"></div>
+        <div class="dashboard-grid">
+          <article class="panel span-3 mechanism-panel"><div class="panel-title"><div><b>异常原因与判定机理</b><small>算法判据、业务含义、可能原因及现场排除项</small></div></div><div id="meteringMechanism"></div></article>
+          <article class="panel span-2"><div class="panel-title"><div><b>近7天用气动态指标</b><small>日用气量变化与异常日定位</small></div><span>m³</span></div><canvas id="volumeChart" height="240"></canvas></article>
+          <article class="panel"><div class="panel-title"><div><b>综合风险</b><small>多维诊断评分</small></div></div><div id="riskGauge" class="gauge"></div><div id="riskFactors" class="factor-list"></div></article>
+          <article class="panel span-3"><div class="panel-title"><div><b>近7天最大瞬时流量</b><small>采用独立纵轴，避免被日累计用气量压缩</small></div><span>m³/h</span></div><canvas id="maxFlowChart" height="190"></canvas></article>
+          <article class="panel span-3"><div class="panel-title"><div><b>当天各管路瞬时流量曲线</b><small>用于识别双管流量失衡、计数时长不符与疑似阻塞</small></div><span>m³/h</span></div><canvas id="flowSignalChart" height="230"></canvas></article>
+          <article class="panel span-2"><div class="panel-title"><div><b>当天异常相关压力曲线</b><small>仅展示触发压力告警的管路对</small></div><span>压力</span></div><canvas id="pressureSignalChart" height="220"></canvas><div id="pressureCurveNote" class="curve-note"></div></article>
+          <article class="panel"><div class="panel-title"><div><b>当天各管路温度曲线</b><small>温差比例与样本熵辅助诊断</small></div><span>℃</span></div><canvas id="temperatureSignalChart" height="220"></canvas></article>
+          <article class="panel"><div class="panel-title"><div><b>表具量程适配</b><small>30天运行区间分布</small></div></div><div id="meterRangeBars" class="bar-list"></div></article>
+          <article class="panel span-2"><div class="panel-title"><div><b>异常区间与证据链</b><small>定位时段、偏差与估算损失</small></div></div><div class="table-wrap"><table><thead><tr><th>开始时间</th><th>结束时间</th><th>异常类型</th><th>观测值</th><th>期望值</th><th>估算补量</th><th>级别</th></tr></thead><tbody id="intervalTable"></tbody></table></div></article>
+          <article class="panel"><div class="panel-title"><div><b>数据质量</b><small>各管路完整度</small></div></div><div id="qualityBars" class="bar-list"></div></article>
+        </div>
+        <div class="agent-layout">
+          <article class="panel input-panel"><div class="panel-title"><div><b>现场文字信息</b><small>录入巡检观察、人员反馈或仪表表现</small></div></div><textarea id="meteringText" placeholder="例如：现场机械字轮无变化，但阀后设备持续运行；压力曲线存在波动，远传表曾短时离线。"></textarea><button class="primary agent-button" data-module="metering">生成智能检查结果</button></article>
+          <article class="panel report-panel" id="meteringReport"><div class="empty-state">输入现场信息后，Agent将联合计量算法结果生成检查结论、证据链与处置建议。</div></article>
+        </div>
+      </section>
+
+      <section id="equipmentPage" class="page">
+        <div class="section-heading"><div><p class="eyebrow">EQUIPMENT HEALTH</p><h2>罗茨流量计健康诊断</h2></div><span id="equipmentStatus" class="status-chip">等待检测</span></div>
+        <div class="kpi-grid" id="equipmentKpis"></div>
+        <div class="dashboard-grid">
+          <article class="panel span-3"><div class="panel-title"><div><b>设备问题Agent解读</b><small>自动解释当前状态、判定依据和优先检查项</small></div></div><div id="equipmentMechanism"></div></article>
+          <article class="panel span-2"><div class="panel-title"><div><b>近7天健康指数演化</b><small>时序一致性校正后的健康轨迹与五阶段阈值</small></div><span>HI / 100</span></div><canvas id="healthChart" height="240"></canvas></article>
+          <article class="panel"><div class="panel-title"><div><b>五阶段概率</b><small>H0 健康 → H4 故障</small></div></div><div id="stageProbabilities" class="bar-list"></div></article>
+          <article class="panel span-2"><div class="panel-title"><div><b>三轴振动波形</b><small>X / Y / Z 同步采样窗口</small></div><span>1000 Hz</span></div><canvas id="waveformChart" height="230"></canvas></article>
+          <article class="panel"><div class="panel-title"><div><b>模型可解释性</b><small>轴向贡献与形态学尺度关注</small></div></div><h4>轴向权重</h4><div id="axisWeights" class="bar-list compact"></div><h4>尺度权重</h4><div id="scaleWeights" class="bar-list compact"></div></article>
+          <article class="panel"><div class="panel-title"><div><b>状态演化</b><small>阶段序列与趋势统计</small></div></div><div id="stageTimeline" class="timeline"></div></article>
+          <article class="panel span-2"><div class="panel-title"><div><b>每日诊断明细</b><small>状态、健康指数、置信度与工况</small></div></div><div class="table-wrap"><table><thead><tr><th>日期</th><th>阶段</th><th>健康指数</th><th>置信度</th><th>运行工况</th><th>原始判定</th></tr></thead><tbody id="healthTable"></tbody></table></div></article>
+        </div>
+        <div class="agent-layout">
+          <article class="panel input-panel"><div class="panel-title"><div><b>现场文字信息</b><small>录入异响、振动、维护和运行表现</small></div></div><textarea id="equipmentText" placeholder="例如：现场听到间歇性异响，表体振动较上周增强；尚未更换轴承，当前负荷约为额定工况的80%。"></textarea><button class="primary agent-button" data-module="equipment">生成智能检查结果</button></article>
+          <article class="panel report-panel" id="equipmentReport"><div class="empty-state">Agent将融合三轴振动诊断、健康趋势和现场文字，生成设备检查结果。</div></article>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/static/app.js"></script>
+  <script src="/static/metering_mechanism.js"></script>
+  <script src="/static/equipment_agent.js"></script>
+</body>
+</html>
