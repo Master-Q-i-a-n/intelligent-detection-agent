@@ -2,30 +2,45 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import secrets
 import threading
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 
 ROOT = Path(__file__).resolve().parent
 
 import duckdb
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from inspection_agent import InspectionAgent
 from daily_dashboard import DailyDiagnosisDashboard
 from smart_metering import SmartMeteringService, long_to_wide
+from safety_operations.db import (
+    accept_agent_notification,
+    accept_local_pending_notifications,
+    connect_database as connect_security_database,
+    get_security_event,
+    get_security_evidence_path,
+    handle_security_event,
+    list_security_events,
+    security_overview,
+)
 
 
 FRONTEND_ROOT = ROOT / "frontend" / "dist"
 EQUIPMENT_INDEX = ROOT / "agent_inputs" / "equipment_health" / "index.json"
 EQUIPMENT_USERS = ROOT / "agent_inputs" / "equipment_health" / "users"
 INPUT_DB = ROOT / "database" / "gas_ai_input.duckdb"
+SAFETY_ROOT = ROOT / "safety_operations"
+SAFETY_DB = SAFETY_ROOT / "data" / "security.db"
+SAFETY_OUTPUT_ROOT = (SAFETY_ROOT / "outputs").resolve()
 
 
 def _refresh_parquet_views() -> None:
@@ -111,6 +126,31 @@ class InspectionRequest(BaseModel):
     diagnosis_date: date
     field_text: str = ""
     context: Dict[str, Any]
+
+
+class SecurityNotification(BaseModel):
+    schema_version: int = 1
+    alert_id: str
+    notification_kind: Literal["CONFIRMED_ALERT", "REVIEW_REQUIRED"]
+    event_id: str
+    source_system: str = "yolo_track"
+    final_decision: Literal["CONFIRMED", "UNCERTAIN"]
+    event_type: str
+    camera_id: str
+    zone_id: Optional[str] = None
+    primary_track_id: Optional[int] = None
+    activated_video_seconds: Optional[float] = None
+    occurred_at: Optional[str] = None
+    severity: Optional[str] = None
+    final_reason: Optional[str] = None
+    recommended_action: Optional[str] = None
+    evidence: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class SecurityActionRequest(BaseModel):
+    action: Literal["ACKNOWLEDGE", "START_PROCESSING", "CLOSE"]
+    operator: str
+    comment: Optional[str] = None
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -221,7 +261,7 @@ def _equipment_for_date(payload: dict[str, Any], diagnosis_date: date) -> dict[s
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "modules": ["smart_metering", "smart_equipment", "inspection_agent"]}
+    return {"status": "ok", "modules": ["smart_metering", "smart_equipment", "inspection_agent", "safety_operations"]}
 
 
 @app.get("/api/users")
@@ -417,6 +457,114 @@ def inspect(request: InspectionRequest):
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _security_connection():
+    return connect_security_database(SAFETY_DB, 5000)
+
+
+@app.post("/internal/security/events")
+def receive_security_event(
+    notification: SecurityNotification,
+    authorization: Optional[str] = Header(default=None),
+):
+    expected = os.getenv("SAFETY_AGENT_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="未配置 SAFETY_AGENT_TOKEN")
+    supplied = (authorization or "").removeprefix("Bearer ").strip()
+    if not supplied or not secrets.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="安防通知鉴权失败")
+    connection = _security_connection()
+    try:
+        with connection:
+            return accept_agent_notification(connection, notification.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+
+@app.get("/security/overview")
+def get_security_overview():
+    connection = _security_connection()
+    try:
+        with connection:
+            accept_local_pending_notifications(connection)
+        return security_overview(connection)
+    finally:
+        connection.close()
+
+
+@app.get("/security/events")
+def get_security_events(
+    decision: Optional[str] = None,
+    handling_status: Optional[str] = None,
+    event_type: Optional[str] = None,
+    camera_id: Optional[str] = None,
+    after_sequence: Optional[int] = None,
+    limit: int = 100,
+):
+    connection = _security_connection()
+    try:
+        with connection:
+            accept_local_pending_notifications(connection)
+        return {"items": list_security_events(
+            connection,
+            decision=decision,
+            handling_status=handling_status,
+            event_type=event_type,
+            camera_id=camera_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )}
+    finally:
+        connection.close()
+
+
+@app.get("/security/events/{event_id}")
+def get_security_event_detail(event_id: str):
+    connection = _security_connection()
+    try:
+        event = get_security_event(connection, event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="安防事件不存在或尚未送达 Agent")
+        return event
+    finally:
+        connection.close()
+
+
+@app.post("/security/events/{event_id}/actions")
+def act_on_security_event(event_id: str, request: SecurityActionRequest):
+    operator = request.operator.strip()
+    if not operator:
+        raise HTTPException(status_code=422, detail="操作人不能为空")
+    connection = _security_connection()
+    try:
+        with connection:
+            return handle_security_event(connection, event_id, request.action, operator, request.comment)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+
+@app.get("/security/events/{event_id}/evidence/{evidence_id}")
+def get_security_evidence(event_id: str, evidence_id: int):
+    connection = _security_connection()
+    try:
+        path = get_security_evidence_path(connection, event_id, evidence_id)
+    finally:
+        connection.close()
+    if path is None:
+        raise HTTPException(status_code=404, detail="安防证据不存在")
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(SAFETY_OUTPUT_ROOT)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="证据路径不在安全作业目录内") from exc
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="安防证据文件已丢失")
+    return FileResponse(resolved)
 
 
 if FRONTEND_ROOT.exists():

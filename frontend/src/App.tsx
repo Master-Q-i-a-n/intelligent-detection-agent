@@ -6,7 +6,8 @@ import { EmptyState, LoadingState } from './components/Common'
 import { EquipmentPage } from './pages/EquipmentPage'
 import { MeteringPage } from './pages/MeteringPage'
 import { OverviewPage } from './pages/OverviewPage'
-import type { PageKey, UserSummary } from './types'
+import { SafetyPage } from './pages/SafetyPage'
+import type { PageKey, SecurityEvent, SecurityOverview, UserSummary } from './types'
 
 function datesBetween(range: [string, string] | [] | undefined): string[] {
   if (!range || range.length !== 2 || !range[0] || !range[1]) return []
@@ -33,6 +34,9 @@ export default function App() {
   // 每次页面加载固定为 false，不读取或写入 localStorage。
   const [autoAgentEnabled, setAutoAgentEnabled] = useState(false)
   const [agentRecords, setAgentRecords] = useState<Record<string, AgentRecord>>({})
+  const [securityOverviewState, setSecurityOverviewState] = useState<SecurityOverview | null>(null)
+  const [securityToast, setSecurityToast] = useState<SecurityEvent | null>(null)
+  const securitySequence = useRef<number | null>(null)
   const claimedAgentKeys = useRef(new Set<string>())
   const agentControllers = useRef(new Map<string, AbortController>())
 
@@ -123,6 +127,44 @@ export default function App() {
     agentControllers.current.forEach((controller) => controller.abort())
   }, [])
 
+  const refreshSecurityOverview = useCallback(async () => {
+    try {
+      setSecurityOverviewState(await api.securityOverview())
+    } catch {
+      // 安防模块离线不阻断计量和设备页面，页面内会展示明确错误状态。
+    }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    async function pollSecurity() {
+      try {
+        const overview = await api.securityOverview()
+        if (!active) return
+        setSecurityOverviewState(overview)
+        if (securitySequence.current === null) {
+          securitySequence.current = overview.latest_sequence
+          return
+        }
+        const result = await api.securityEvents({ after_sequence: securitySequence.current, limit: 20 })
+        if (!active) return
+        if (result.items.length) {
+          securitySequence.current = Math.max(...result.items.map((item) => item.notification_sequence), securitySequence.current)
+          const confirmed = result.items.find((item) => item.final_decision === 'CONFIRMED')
+          if (confirmed) setSecurityToast(confirmed)
+        }
+      } catch {
+        // 轮询失败会在下一周期自动恢复，不重复弹出全局错误。
+      }
+    }
+    void pollSecurity()
+    const timer = window.setInterval(pollSecurity, 5_000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [])
+
   const openIssue = useCallback((nextPage: PageKey, nextUserId: string) => {
     changeUser(nextUserId)
     setPage(nextPage)
@@ -132,7 +174,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <Sidebar page={page} onPageChange={setPage} autoAgentEnabled={autoAgentEnabled} onAutoAgentChange={changeAutoAgent} />
+      <Sidebar page={page} onPageChange={setPage} autoAgentEnabled={autoAgentEnabled} onAutoAgentChange={changeAutoAgent} safetyBadge={securityOverviewState?.new_count || 0} />
       <main className="main-shell">
         <Topbar
           page={page}
@@ -146,17 +188,26 @@ export default function App() {
           onRefresh={() => setRefreshToken((value) => value + 1)}
         />
         <div className="content-shell">
-          {initialError && !date ? (
+          {initialError && !date && page !== 'safety' ? (
             <EmptyState title="无法进入检测流程" detail={initialError} />
           ) : (
             <>
               {page === 'overview' && <OverviewPage active date={date} refreshToken={refreshToken} onBusyChange={setBusy} onOpenIssue={openIssue} />}
               {page === 'metering' && <MeteringPage active userId={userId} date={date} refreshToken={refreshToken} autoAgentEnabled={autoAgentEnabled} autoRecord={agentRecords[activeAgentKey]} onAutoRequest={requestAutoAgent} onBusyChange={setBusy} />}
               {page === 'equipment' && <EquipmentPage active userId={userId} date={date} refreshToken={refreshToken} autoAgentEnabled={autoAgentEnabled} autoRecord={agentRecords[activeAgentKey]} onAutoRequest={requestAutoAgent} onBusyChange={setBusy} />}
+              {page === 'safety' && <SafetyPage refreshToken={refreshToken} liveSequence={securityOverviewState?.latest_sequence || 0} onBusyChange={setBusy} onChanged={refreshSecurityOverview} />}
             </>
           )}
         </div>
       </main>
+      {securityToast && (
+        <button className="security-toast" type="button" onClick={() => { setPage('safety'); setSecurityToast(null) }} aria-label="打开新安防告警">
+          <span>SAFETY ALERT</span>
+          <strong>发现新的安全作业问题</strong>
+          <small>{securityToast.latest_review_explanation || securityToast.final_reason || securityToast.event_type}</small>
+          <i>打开事件 →</i>
+        </button>
+      )}
     </div>
   )
 }

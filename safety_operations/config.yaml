@@ -1,0 +1,101 @@
+camera:
+  id: camera_01
+  name: 一号作业区摄像头
+  # 运行时建议通过 --source 显式指定本地视频；后续可扩展 RTSP。
+  source: ""
+
+model:
+  path: models/helmet_detector.pt
+  device: auto
+  tracker: bytetrack.yaml
+  confidence: 0.25
+  image_size: 640
+
+zone:
+  id: work_area
+  name: 中心作业区
+  polygon:
+    - [0.25, 0.25]
+    - [0.75, 0.25]
+    - [0.90, 0.90]
+    - [0.15, 0.90]
+
+tracking:
+  enter_confirm_seconds: 0.5
+  exit_confirm_seconds: 0.8
+  lost_grace_seconds: 2.0
+  state_expire_seconds: 5.0
+  rule_interval_seconds: 1.0
+
+rules:
+  count:
+    enabled: true
+    max_people: 3
+    violation_confirm_seconds: 3.0
+    recovery_confirm_seconds: 2.0
+  dwell:
+    enabled: true
+    max_seconds: 300.0
+  helmet:
+    enabled: true
+    scope: all
+    head_height_ratio: 0.35
+    min_person_box_height: 80
+    head_border_margin_pixels: 2
+    min_person_visible_seconds: 3.0
+    window_seconds: 3.0
+    min_evaluable_frames: 12
+    violation_helmet_ratio: 0.20
+    violation_no_helmet_ratio: 0.50
+    recovery_helmet_ratio: 0.60
+    violation_confirm_seconds: 1.0
+    recovery_confirm_seconds: 1.0
+
+display:
+  show: true
+  mode: debug
+  panel_width: 320
+  font_path: C:/Windows/Fonts/msyh.ttc
+  font_size: 18
+
+output:
+  root: outputs
+  save_video: true
+  save_states: true
+  save_events: true
+  save_evidence: true
+
+database:
+  enabled: true
+  path: data/security.db
+  auto_sync: true
+  busy_timeout_ms: 5000
+  rule_version: safety_rules_v2
+
+review:
+  enabled: true
+  mode: active
+  provider: volcengine_ark
+  base_url: https://ark.cn-beijing.volces.com/api/v3
+  api_key_env: ARK_API_KEY
+  model_env: ARK_MODEL_ID
+  event_types: [NO_HELMET]
+  pre_seconds: 3.0
+  post_seconds: 2.0
+  clip_fps: 5.0
+  video_preprocess_fps: 2.0
+  file_processing_timeout_seconds: 120
+  max_clip_width: 1280
+  timeout_seconds: 60
+  retry_count: 1
+  max_output_tokens: 500
+  prompt_version: no_helmet_v2
+  delete_remote_files: true
+
+agent_notification:
+  enabled: true
+  endpoint: http://127.0.0.1:8000/internal/security/events
+  token_env: SAFETY_AGENT_TOKEN
+  timeout_seconds: 10
+  max_attempts: 5
+

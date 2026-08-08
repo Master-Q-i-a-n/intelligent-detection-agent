@@ -31,6 +31,8 @@ frontend/test-results/
 frontend/playwright-report/
 frontend/.vite/
 frontend/coverage/
+output/playwright/
+.playwright-cli/
 
 # uv / Python 工具缓存（uv.lock 应提交）
 .uv-cache/
@@ -56,6 +58,13 @@ database/*.duckdb.wal
 models/**/*.pt
 models/**/*.pth
 agent_inputs/
+
+# 安全作业运行资产与历史数据（代码和脱敏配置仍提交）
+safety_operations/models/*.pt
+safety_operations/data/
+safety_operations/outputs/
+safety_operations/config.local.yaml
+safety_operations/docs/
 
 # 运行和验证报告
 reports/

@@ -1,4 +1,4 @@
-export type PageKey = 'overview' | 'metering' | 'equipment'
+export type PageKey = 'overview' | 'metering' | 'equipment' | 'safety'
 export type BusinessModule = 'metering' | 'equipment'
 
 export interface UserSummary {
@@ -187,4 +187,61 @@ export interface AgentInspectionPayload {
   diagnosis_date: string
   field_text: string
   context: Record<string, unknown>
+}
+
+export type SecurityDecision = 'CONFIRMED' | 'UNCERTAIN'
+export type SecurityHandlingStatus = 'NEW' | 'ACKNOWLEDGED' | 'PROCESSING' | 'CLOSED'
+
+export interface SecurityOverview {
+  total: number
+  confirmed: number
+  review_required: number
+  new_count: number
+  processing: number
+  high_risk: number
+  latest_sequence: number
+}
+
+export interface SecurityEvidence {
+  evidence_id: number
+  evidence_type: string
+  mime_type: string | null
+  file_size?: number | null
+  metadata_json?: string | null
+}
+
+export interface SecurityAction {
+  action_id: string
+  action: string
+  operator: string
+  comment: string | null
+  previous_status: string
+  new_status: string
+  acted_at: string
+}
+
+export interface SecurityEvent {
+  notification_sequence: number
+  notification_kind: 'CONFIRMED_ALERT' | 'REVIEW_REQUIRED'
+  sent_at: string
+  event_id: string
+  source_system: string
+  event_type: string
+  camera_id: string
+  zone_id: string | null
+  primary_track_id: number | null
+  lifecycle_status: string
+  activated_video_seconds: number | null
+  occurred_at: string | null
+  severity: string | null
+  final_decision: SecurityDecision
+  final_reason: string | null
+  recommended_action: string | null
+  handling_status: SecurityHandlingStatus
+  latest_review_helmet_status: string | null
+  latest_review_explanation: string | null
+  latest_reviewed_at: string | null
+  evidence_count: number
+  evidence?: SecurityEvidence[]
+  actions?: SecurityAction[]
 }

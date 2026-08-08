@@ -4,6 +4,7 @@ const navItems: Array<{ key: PageKey; index: string; label: string; english: str
   { key: 'overview', index: '00', label: '每日巡检总览', english: 'Daily Inspection' },
   { key: 'metering', index: '01', label: '智能计量详情', english: 'Metering Evidence' },
   { key: 'equipment', index: '02', label: '智能设备详情', english: 'Equipment Evidence' },
+  { key: 'safety', index: '03', label: '安全作业', english: 'Safety Operations' },
 ]
 
 export function Sidebar({
@@ -11,11 +12,13 @@ export function Sidebar({
   onPageChange,
   autoAgentEnabled,
   onAutoAgentChange,
+  safetyBadge = 0,
 }: {
   page: PageKey
   onPageChange: (page: PageKey) => void
   autoAgentEnabled: boolean
   onAutoAgentChange: (enabled: boolean) => void
+  safetyBadge?: number
 }) {
   return (
     <aside className="sidebar">
@@ -41,6 +44,7 @@ export function Sidebar({
               <b>{item.label}</b>
               <small>{item.english}</small>
             </div>
+            {item.key === 'safety' && safetyBadge > 0 && <em className="nav-badge">{safetyBadge > 99 ? '99+' : safetyBadge}</em>}
           </button>
         ))}
       </nav>
@@ -64,7 +68,7 @@ export function Sidebar({
           <span />
         </button>
         <p>自动解读：<b>{autoAgentEnabled ? '已开启' : '已关闭'}</b></p>
-        <small>{autoAgentEnabled ? '企业、日期或模块变化时调用一次 LLM' : '当前不主动调用 LLM，手动生成仍可使用'}</small>
+        <small>{page === 'safety' ? '安防复核独立运行，本开关不影响安全告警' : autoAgentEnabled ? '企业、日期或模块变化时调用一次 LLM' : '当前不主动调用 LLM，手动生成仍可使用'}</small>
       </section>
 
       <div className="system-status">
@@ -103,6 +107,7 @@ export function Topbar({
     overview: ['每日全量自诊断', 'DAILY AUTONOMOUS INSPECTION'],
     metering: ['智能计量证据中心', 'METERING DIAGNOSTIC EVIDENCE'],
     equipment: ['智能设备健康中心', 'EQUIPMENT HEALTH EVIDENCE'],
+    safety: ['安全作业事件中心', 'SAFETY OPERATIONS CENTER'],
   }
   return (
     <header className="topbar">
@@ -111,7 +116,7 @@ export function Topbar({
         <h1>{titles[page][0]}</h1>
       </div>
       <div className="filters">
-        {page !== 'overview' && (
+        {page !== 'overview' && page !== 'safety' && (
           <label>
             <span>检测企业</span>
             <select value={userId} onChange={(event) => onUserChange(event.target.value)} disabled={!users.length}>
@@ -123,15 +128,15 @@ export function Topbar({
             </select>
           </label>
         )}
-        <label>
+        {page !== 'safety' && <label>
           <span>检测日期</span>
           <select value={date} onChange={(event) => onDateChange(event.target.value)} disabled={!dates.length}>
             {!dates.length && <option value="">无可用日期</option>}
             {dates.map((item) => <option value={item} key={item}>{item}</option>)}
           </select>
-        </label>
-        <button className="button button-primary" type="button" disabled={busy || !date} onClick={onRefresh}>
-          {busy ? '数据处理中…' : page === 'overview' ? '执行每日全量诊断' : '刷新诊断证据'}
+        </label>}
+        <button className="button button-primary" type="button" disabled={busy || (page !== 'safety' && !date)} onClick={onRefresh}>
+          {busy ? '数据处理中…' : page === 'overview' ? '执行每日全量诊断' : page === 'safety' ? '刷新安防事件' : '刷新诊断证据'}
         </button>
       </div>
     </header>

@@ -7,6 +7,8 @@ import type {
   MeteringDiagnosis,
   MeteringHistoryItem,
   MeteringSignals,
+  SecurityEvent,
+  SecurityOverview,
   UserListResponse,
 } from './types'
 
@@ -95,4 +97,20 @@ export const api = {
       signal,
       timeoutMs: 120_000,
     }),
+  securityOverview: (signal?: AbortSignal) => requestJson<SecurityOverview>('/security/overview', { signal }),
+  securityEvents: (params: Record<string, string | number | undefined> = {}, signal?: AbortSignal) => {
+    const query = new URLSearchParams()
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== '') query.set(key, String(value))
+    })
+    const suffix = query.size ? `?${query.toString()}` : ''
+    return requestJson<{ items: SecurityEvent[] }>(`/security/events${suffix}`, { signal })
+  },
+  securityEvent: (eventId: string, signal?: AbortSignal) =>
+    requestJson<SecurityEvent>(`/security/events/${encodeURIComponent(eventId)}`, { signal }),
+  securityAction: (eventId: string, action: string, operator: string, comment = '') =>
+    requestJson<{ event_id: string; previous_status: string; handling_status: string }>(
+      `/security/events/${encodeURIComponent(eventId)}/actions`,
+      { method: 'POST', body: JSON.stringify({ action, operator, comment }) },
+    ),
 }

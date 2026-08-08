@@ -226,3 +226,23 @@ pnpm --dir frontend build
 ```
 
 若当前项目根目录的 `.env` 中大模型配置可用，Agent 会在本地规则报告上进行受约束的语言增强；接口不可用时自动回退至本地可审计规则，不影响页面检测功能。可复制 `.env.example` 后填写真实密钥。
+
+## 安全作业
+
+`safety_operations` 集成 YOLO/ByteTrack、安防规则、多模态视频复核、SQLite 最终决策、Agent 发件箱和处置审计。安全事件与 Agent 共用 `safety_operations/data/security.db`，不会复制第二份事件库。
+
+在 `.env` 配置 `ARK_API_KEY`、`ARK_MODEL_ID` 和 `SAFETY_AGENT_TOKEN` 后，显式运行：
+
+```powershell
+uv run python -m safety_operations.monitor `
+  --config .\safety_operations\config.yaml `
+  --source 'E:\path\to\video.mp4'
+```
+
+检测结束后会自动复核本次 `ACTIVE` 事件。确认问题进入 `alert_records` 发件箱并通知 Agent；证据不足进入待人工复核列表；排除事件只保留审计记录。Agent 未运行时可在启动后通过页面自动补收，或显式重试：
+
+```powershell
+uv run python -m safety_operations.notifier --config .\safety_operations\config.yaml
+```
+
+启动 Agent 后在侧栏进入“安全作业”，可查看证据并执行确认、开始处理和关闭。每次操作追加到 `event_handling_actions`。

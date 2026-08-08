@@ -13,6 +13,10 @@ vi.mock('./api', () => ({
     equipmentDashboard: vi.fn(),
     equipmentWaveform: vi.fn(),
     inspectAgent: vi.fn(),
+    securityOverview: vi.fn(),
+    securityEvents: vi.fn(),
+    securityEvent: vi.fn(),
+    securityAction: vi.fn(),
   },
 }))
 
@@ -41,6 +45,8 @@ function prepareApi(range: [string, string] | [] = ['2025-01-11', '2025-01-12'])
   vi.mocked(api.meteringHistory).mockResolvedValue({ user_id: 'u1', items: [] })
   vi.mocked(api.meteringSignals).mockResolvedValue({ user_id: 'u1', diagnosis_date: '2025-01-12', times: [], resample_frequency: '5min', point_count: 0, pipelines: {} })
   vi.mocked(api.inspectAgent).mockResolvedValue({ generator: 'llm', conclusion: '检查完成' })
+  vi.mocked(api.securityOverview).mockResolvedValue({ total: 0, confirmed: 0, review_required: 0, new_count: 0, processing: 0, high_risk: 0, latest_sequence: 0 })
+  vi.mocked(api.securityEvents).mockResolvedValue({ items: [] })
 }
 
 beforeEach(() => {
