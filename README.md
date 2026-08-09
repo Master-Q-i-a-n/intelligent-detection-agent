@@ -145,7 +145,7 @@ uv run python .\metering_cli.py `
 前端已迁移为 React + TypeScript + Vite，并使用 ECharts 绘制所有业务图表。首次使用先安装前端依赖：
 
 ```powershell
-pnpm --dir frontend install
+npm --prefix frontend install
 ```
 
 开发模式需要在两个终端中分别显式启动（项目不会自动启动服务）：
@@ -155,7 +155,7 @@ pnpm --dir frontend install
 .\start_api.ps1
 
 # 终端 2：Vite 开发服务器
-pnpm --dir frontend dev
+npm --prefix frontend run dev
 ```
 
 开发页面地址为 `http://127.0.0.1:5173/`，Vite 会将 `/api`、`/daily`、`/metering`、
@@ -164,7 +164,7 @@ pnpm --dir frontend dev
 生产模式先构建前端，再显式启动 FastAPI：
 
 ```powershell
-pnpm --dir frontend build
+npm --prefix frontend run build
 .\start_api.ps1
 ```
 
@@ -175,15 +175,51 @@ pnpm --dir frontend build
 `/agent/inspect`，但详情页的“生成智能检查结果”按钮仍会按用户操作调用；开启后会按
 `模块 + 企业 + 日期` 对当前详情自动调用一次。
 
+### 多轮智能问答
+
+侧栏“智能问答”使用单个 DeepAgent 查询用气、智能计量、智能设备和安全作业数据，支持：
+
+- “昨天有哪些用户的用气量超过1000立方米”等自然语言只读查询；
+- 按真实当前时间解析今天、昨天、上周等相对日期；
+- 查询计量诊断、设备健康、安防事件和现有工单；
+- 生成包含 ECharts 图表、表格和 SQL 来源的结构化报告；
+- 浏览器下载含图 HTML，下载不触发人工确认；
+- 创建计量、设备或安防来源工单，写入前必须批准、修改或拒绝；
+- 信息不足时暂停并等待补充条件。
+
+数据库查询由 `sqlglot` AST、表白名单、只读连接、行数/大小/超时共同限制。Agent 不具备
+Shell 或 Python 执行能力，FilesystemBackend 只读挂载 `conversation_agent/skills`，并禁止
+所有文件写入。安防事件在对话中只能查询，确认、处理和关闭仍需进入“安全作业”页面。
+
+对话只使用进程内短期状态，不配置长期记忆；页面刷新或新建对话后不会继续旧会话。对话页使用
+POST + SSE 流式显示回答，并保留可折叠的任务 Todo；工具执行流水和模型隐藏推理均不在页面展示。
+报告正文使用安全的 GFM Markdown 渲染。数据与报告面板默认隐藏，每条回答通过独立按钮打开本轮报告、SQL 或工单；
+新报告生成后自动展开。桌面端可拖动分隔条，窄屏使用全屏产物抽屉，面板状态和宽度仅在当前页面会话有效。
+可在
+`.env` 使用 `CHAT_LLM_PROVIDER`、`CHAT_LLM_API_KEY`、`CHAT_LLM_BASE_URL`、
+`CHAT_LLM_MODEL` 单独配置，未填写时沿用现有 DeepSeek/LLM 配置。
+
+LangSmith 默认关闭。需要追踪时在 `.env` 设置 `LANGSMITH_TRACING=true`、`LANGSMITH_API_KEY` 和
+`LANGSMITH_PROJECT`；可选设置 `LANGSMITH_ENDPOINT`、`LANGCHAIN_HIDE_INPUTS/OUTPUTS`。状态接口只返回
+`tracing_enabled` 布尔值，不会把 Key 或 Trace 内容发给前端。
+
+新增接口：
+
+- `GET /chat/status`
+- `POST /chat/turns`
+- `POST /chat/resume`
+- `POST /chat/turns/stream`
+- `POST /chat/resume/stream`
+
 前端检查命令：
 
 ```powershell
-pnpm --dir frontend typecheck
-pnpm --dir frontend test
-pnpm --dir frontend build
+npm --prefix frontend run typecheck
+npm --prefix frontend test
+npm --prefix frontend run build
 
 # 视觉测试要求开发页面已经由用户显式启动
-pnpm --dir frontend test:e2e
+npm --prefix frontend run test:e2e
 ```
 
 ### 启动API
@@ -220,8 +256,8 @@ Windows 启动方式：
 ```powershell
 cd E:\MyWork\Agent\intelligent-detection-agent
 uv sync
-pnpm --dir frontend install
-pnpm --dir frontend build
+npm --prefix frontend install
+npm --prefix frontend run build
 .\start_api.ps1
 ```
 

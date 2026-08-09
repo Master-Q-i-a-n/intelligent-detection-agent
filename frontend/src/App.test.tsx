@@ -17,6 +17,9 @@ vi.mock('./api', () => ({
     securityEvents: vi.fn(),
     securityEvent: vi.fn(),
     securityAction: vi.fn(),
+    chatStatus: vi.fn(),
+    chatTurn: vi.fn(),
+    chatResume: vi.fn(),
   },
 }))
 
@@ -47,6 +50,7 @@ function prepareApi(range: [string, string] | [] = ['2025-01-11', '2025-01-12'])
   vi.mocked(api.inspectAgent).mockResolvedValue({ generator: 'llm', conclusion: '检查完成' })
   vi.mocked(api.securityOverview).mockResolvedValue({ total: 0, confirmed: 0, review_required: 0, new_count: 0, processing: 0, high_risk: 0, latest_sequence: 0 })
   vi.mocked(api.securityEvents).mockResolvedValue({ items: [] })
+  vi.mocked(api.chatStatus).mockResolvedValue({ configured: true, provider: 'deepseek', model: 'deepseek-chat', memory: 'in-process-thread-only', tracing_enabled: false })
 }
 
 beforeEach(() => {
@@ -122,5 +126,15 @@ describe('日期和图表边界', () => {
   it('日期生成包含首尾且拒绝无效范围', () => {
     expect(datesBetween(['2025-01-11', '2025-01-12'])).toEqual(['2025-01-11', '2025-01-12'])
     expect(datesBetween(['2025-01-12', '2025-01-11'])).toEqual([])
+  })
+})
+
+describe('智能问答入口', () => {
+  it('从侧栏进入独立临时对话，不依赖检测日期筛选', async () => {
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /智能问答/ }))
+    expect(await screen.findByText('燃气业务智能问答')).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: '对话输入' })).toBeEnabled()
+    expect(screen.queryByLabelText('检测日期')).not.toBeInTheDocument()
   })
 })

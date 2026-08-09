@@ -7,6 +7,7 @@ import { EquipmentPage } from './pages/EquipmentPage'
 import { MeteringPage } from './pages/MeteringPage'
 import { OverviewPage } from './pages/OverviewPage'
 import { SafetyPage } from './pages/SafetyPage'
+import { ChatPage } from './pages/ChatPage'
 import type { PageKey, SecurityEvent, SecurityOverview, UserSummary } from './types'
 
 function datesBetween(range: [string, string] | [] | undefined): string[] {
@@ -188,7 +189,7 @@ export default function App() {
           onRefresh={() => setRefreshToken((value) => value + 1)}
         />
         <div className="content-shell">
-          {initialError && !date && page !== 'safety' ? (
+          {initialError && !date && page !== 'safety' && page !== 'chat' ? (
             <EmptyState title="无法进入检测流程" detail={initialError} />
           ) : (
             <>
@@ -196,6 +197,7 @@ export default function App() {
               {page === 'metering' && <MeteringPage active userId={userId} date={date} refreshToken={refreshToken} autoAgentEnabled={autoAgentEnabled} autoRecord={agentRecords[activeAgentKey]} onAutoRequest={requestAutoAgent} onBusyChange={setBusy} />}
               {page === 'equipment' && <EquipmentPage active userId={userId} date={date} refreshToken={refreshToken} autoAgentEnabled={autoAgentEnabled} autoRecord={agentRecords[activeAgentKey]} onAutoRequest={requestAutoAgent} onBusyChange={setBusy} />}
               {page === 'safety' && <SafetyPage refreshToken={refreshToken} liveSequence={securityOverviewState?.latest_sequence || 0} onBusyChange={setBusy} onChanged={refreshSecurityOverview} />}
+              {page === 'chat' && <ChatPage />}
             </>
           )}
         </div>

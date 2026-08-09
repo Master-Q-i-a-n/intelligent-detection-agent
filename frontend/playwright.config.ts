@@ -6,6 +6,8 @@ export default defineConfig({
   reporter: 'list',
   use: {
     baseURL: process.env.PLAYWRIGHT_BASE_URL || 'http://127.0.0.1:5173',
+    // CI 可使用 Playwright 自带 Chromium，本机也可通过 PLAYWRIGHT_CHANNEL=chrome 复用已安装浏览器。
+    channel: process.env.PLAYWRIGHT_CHANNEL || undefined,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },

@@ -32,6 +32,7 @@ from safety_operations.db import (
     list_security_events,
     security_overview,
 )
+from conversation_api import create_conversation_router
 
 
 FRONTEND_ROOT = ROOT / "frontend" / "dist"
@@ -76,6 +77,7 @@ def _refresh_parquet_views() -> None:
 _refresh_parquet_views()
 
 app = FastAPI(title="燃气计量与设备健康智能检测平台", version="1.0.0")
+app.include_router(create_conversation_router(ROOT))
 service = SmartMeteringService(use_deep_model=True)
 fast_service = SmartMeteringService(use_deep_model=False)
 inspection_agent = InspectionAgent(ROOT)
@@ -261,7 +263,10 @@ def _equipment_for_date(payload: dict[str, Any], diagnosis_date: date) -> dict[s
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "modules": ["smart_metering", "smart_equipment", "inspection_agent", "safety_operations"]}
+    return {
+        "status": "ok",
+        "modules": ["smart_metering", "smart_equipment", "inspection_agent", "safety_operations", "conversation_agent"],
+    }
 
 
 @app.get("/api/users")

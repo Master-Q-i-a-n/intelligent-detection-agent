@@ -16,7 +16,7 @@ export default defineConfig(({ command }) => ({
     host: '127.0.0.1',
     port: 5173,
     proxy: Object.fromEntries(
-      ['/api', '/daily', '/metering', '/equipment', '/agent', '/users', '/health', '/security', '/internal'].map((prefix) => [
+      ['/api', '/daily', '/metering', '/equipment', '/agent', '/chat', '/users', '/health', '/security', '/internal'].map((prefix) => [
         prefix,
         { target: backend, changeOrigin: true },
       ]),

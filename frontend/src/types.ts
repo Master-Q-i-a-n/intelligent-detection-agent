@@ -1,4 +1,4 @@
-export type PageKey = 'overview' | 'metering' | 'equipment' | 'safety'
+export type PageKey = 'overview' | 'metering' | 'equipment' | 'safety' | 'chat'
 export type BusinessModule = 'metering' | 'equipment'
 
 export interface UserSummary {
@@ -244,4 +244,74 @@ export interface SecurityEvent {
   evidence_count: number
   evidence?: SecurityEvidence[]
   actions?: SecurityAction[]
+}
+
+export type ChatArtifactType = 'query_result' | 'report' | 'work_order'
+
+export interface ChatArtifact {
+  type: ChatArtifactType
+  id: string
+  payload: Record<string, unknown>
+}
+
+export interface ChatInterrupt {
+  kind: 'clarification' | 'work_order_approval'
+  question?: string
+  missing_information?: string[]
+  suggestions?: string[]
+  action?: {
+    name?: string
+    arguments?: Record<string, unknown>
+    args?: Record<string, unknown>
+    description?: string
+  }
+  allowed_decisions?: Array<'approve' | 'edit' | 'reject'>
+}
+
+export interface ChatTurnResponse {
+  status: 'completed' | 'interrupted'
+  message: string
+  generator: string
+  artifacts: ChatArtifact[]
+  todos?: ChatTodo[]
+  interrupt?: ChatInterrupt | null
+}
+
+export interface ChatTodo {
+  content: string
+  status: 'pending' | 'in_progress' | 'completed'
+}
+
+export type ChatStreamEventName =
+  | 'meta'
+  | 'status'
+  | 'todo'
+  | 'tool_start'
+  | 'tool_end'
+  | 'answer_delta'
+  | 'answer_reset'
+  | 'artifact'
+  | 'interrupt'
+  | 'done'
+  | 'error'
+
+export interface ChatStreamEvent {
+  event: ChatStreamEventName
+  data: Record<string, unknown>
+}
+
+export interface ChatResumePayload {
+  thread_id: string
+  kind: ChatInterrupt['kind']
+  decision: 'answer' | 'approve' | 'edit' | 'reject'
+  message?: string
+  edited_action?: Record<string, unknown>
+}
+
+export interface ChatStatus {
+  configured: boolean
+  provider: string
+  model: string
+  memory: string
+  tracing_enabled: boolean
 }

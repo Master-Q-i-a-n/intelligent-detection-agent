@@ -1,5 +1,6 @@
 CREATE SCHEMA IF NOT EXISTS metering;
 CREATE SCHEMA IF NOT EXISTS equipment;
+CREATE SCHEMA IF NOT EXISTS operations;
 
 CREATE TABLE IF NOT EXISTS metering.diagnosis_run (
     run_id VARCHAR PRIMARY KEY,
@@ -84,4 +85,30 @@ CREATE TABLE IF NOT EXISTS equipment.health_trend (
     model_version VARCHAR,
     details_json VARCHAR,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 对话 Agent 的跨模块工单与审计，和诊断结果共用一个 DuckDB。
+CREATE TABLE IF NOT EXISTS operations.work_order (
+    work_order_id VARCHAR PRIMARY KEY,
+    idempotency_key VARCHAR UNIQUE NOT NULL,
+    source_module VARCHAR NOT NULL,
+    user_id VARCHAR,
+    source_reference_json VARCHAR NOT NULL,
+    priority VARCHAR NOT NULL,
+    status VARCHAR NOT NULL,
+    title VARCHAR NOT NULL,
+    description VARCHAR NOT NULL,
+    checklist_json VARCHAR NOT NULL,
+    created_by VARCHAR NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS operations.work_order_audit (
+    audit_id VARCHAR PRIMARY KEY,
+    work_order_id VARCHAR NOT NULL,
+    action VARCHAR NOT NULL,
+    operator VARCHAR NOT NULL,
+    details_json VARCHAR NOT NULL,
+    acted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

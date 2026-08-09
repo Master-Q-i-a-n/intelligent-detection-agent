@@ -9,6 +9,10 @@ import type {
   MeteringSignals,
   SecurityEvent,
   SecurityOverview,
+  ChatResumePayload,
+  ChatStatus,
+  ChatStreamEvent,
+  ChatTurnResponse,
   UserListResponse,
 } from './types'
 
@@ -19,6 +23,66 @@ export class ApiError extends Error {
   ) {
     super(message)
     this.name = 'ApiError'
+  }
+}
+
+interface StreamOptions extends RequestInit {
+  onEvent: (event: ChatStreamEvent) => void
+}
+
+/** 解析 FastAPI 返回的 POST + SSE；注释心跳不会进入业务事件。 */
+export async function requestSse(path: string, options: StreamOptions): Promise<void> {
+  const { onEvent, ...requestOptions } = options
+  const response = await fetch(path, {
+    ...requestOptions,
+    headers: {
+      Accept: 'text/event-stream',
+      'Content-Type': 'application/json',
+      ...requestOptions.headers,
+    },
+  })
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as { detail?: string } | null
+    throw new ApiError(payload?.detail || `请求失败（HTTP ${response.status}）`, response.status)
+  }
+  if (!response.body) throw new ApiError('浏览器未收到流式响应', 502)
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  const dispatchBlock = (block: string) => {
+    let eventName = 'message'
+    const dataLines: string[] = []
+    block.split('\n').forEach((line) => {
+      if (line.startsWith(':')) return
+      if (line.startsWith('event:')) eventName = line.slice(6).trim()
+      if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart())
+    })
+    if (!dataLines.length || eventName === 'message') return
+    const data = JSON.parse(dataLines.join('\n')) as Record<string, unknown>
+    onEvent({ event: eventName as ChatStreamEvent['event'], data })
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      buffer += decoder.decode(value, { stream: !done }).replaceAll('\r\n', '\n')
+      let boundary = buffer.indexOf('\n\n')
+      while (boundary >= 0) {
+        dispatchBlock(buffer.slice(0, boundary))
+        buffer = buffer.slice(boundary + 2)
+        boundary = buffer.indexOf('\n\n')
+      }
+      if (done) break
+    }
+    if (buffer.trim()) dispatchBlock(buffer)
+  } catch (error) {
+    // 回调解析失败时主动取消响应体，使服务端尽快感知客户端已离开。
+    await reader.cancel().catch(() => undefined)
+    throw error
+  } finally {
+    reader.releaseLock()
   }
 }
 
@@ -113,4 +177,27 @@ export const api = {
       `/security/events/${encodeURIComponent(eventId)}/actions`,
       { method: 'POST', body: JSON.stringify({ action, operator, comment }) },
     ),
+  chatStatus: (signal?: AbortSignal) => requestJson<ChatStatus>('/chat/status', { signal }),
+  chatTurn: (threadId: string, message: string, signal?: AbortSignal) =>
+    requestJson<ChatTurnResponse>('/chat/turns', {
+      method: 'POST',
+      body: JSON.stringify({ thread_id: threadId, message }),
+      signal,
+      timeoutMs: 180_000,
+    }),
+  chatResume: (payload: ChatResumePayload, signal?: AbortSignal) =>
+    requestJson<ChatTurnResponse>('/chat/resume', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      signal,
+      timeoutMs: 180_000,
+    }),
+  chatTurnStream: (threadId: string, message: string, onEvent: (event: ChatStreamEvent) => void, signal?: AbortSignal) =>
+    requestSse('/chat/turns/stream', {
+      method: 'POST', body: JSON.stringify({ thread_id: threadId, message }), onEvent, signal,
+    }),
+  chatResumeStream: (payload: ChatResumePayload, onEvent: (event: ChatStreamEvent) => void, signal?: AbortSignal) =>
+    requestSse('/chat/resume/stream', {
+      method: 'POST', body: JSON.stringify(payload), onEvent, signal,
+    }),
 }

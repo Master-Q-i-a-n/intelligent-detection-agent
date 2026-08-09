@@ -5,6 +5,7 @@ const navItems: Array<{ key: PageKey; index: string; label: string; english: str
   { key: 'metering', index: '01', label: '智能计量详情', english: 'Metering Evidence' },
   { key: 'equipment', index: '02', label: '智能设备详情', english: 'Equipment Evidence' },
   { key: 'safety', index: '03', label: '安全作业', english: 'Safety Operations' },
+  { key: 'chat', index: '04', label: '智能问答', english: 'AI Assistant' },
 ]
 
 export function Sidebar({
@@ -108,6 +109,7 @@ export function Topbar({
     metering: ['智能计量证据中心', 'METERING DIAGNOSTIC EVIDENCE'],
     equipment: ['智能设备健康中心', 'EQUIPMENT HEALTH EVIDENCE'],
     safety: ['安全作业事件中心', 'SAFETY OPERATIONS CENTER'],
+    chat: ['燃气业务智能问答', 'GAS BUSINESS AI ASSISTANT'],
   }
   return (
     <header className="topbar">
@@ -116,7 +118,7 @@ export function Topbar({
         <h1>{titles[page][0]}</h1>
       </div>
       <div className="filters">
-        {page !== 'overview' && page !== 'safety' && (
+        {page !== 'overview' && page !== 'safety' && page !== 'chat' && (
           <label>
             <span>检测企业</span>
             <select value={userId} onChange={(event) => onUserChange(event.target.value)} disabled={!users.length}>
@@ -128,16 +130,18 @@ export function Topbar({
             </select>
           </label>
         )}
-        {page !== 'safety' && <label>
+        {page !== 'safety' && page !== 'chat' && <label>
           <span>检测日期</span>
           <select value={date} onChange={(event) => onDateChange(event.target.value)} disabled={!dates.length}>
             {!dates.length && <option value="">无可用日期</option>}
             {dates.map((item) => <option value={item} key={item}>{item}</option>)}
           </select>
         </label>}
-        <button className="button button-primary" type="button" disabled={busy || (page !== 'safety' && !date)} onClick={onRefresh}>
-          {busy ? '数据处理中…' : page === 'overview' ? '执行每日全量诊断' : page === 'safety' ? '刷新安防事件' : '刷新诊断证据'}
-        </button>
+        {page !== 'chat' && (
+          <button className="button button-primary" type="button" disabled={busy || (page !== 'safety' && !date)} onClick={onRefresh}>
+            {busy ? '数据处理中…' : page === 'overview' ? '执行每日全量诊断' : page === 'safety' ? '刷新安防事件' : '刷新诊断证据'}
+          </button>
+        )}
       </div>
     </header>
   )
