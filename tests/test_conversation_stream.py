@@ -94,7 +94,7 @@ def test_stream_protocol_contains_safe_lifecycle(tmp_path: Path):
         service = ConversationAgentService(tmp_path)
         fake_agent = _FakeAgent()
         service._agent = fake_agent
-        events = [event async for event in service.stream_turn("thread-1", "现在几点")]
+        events = [event async for event in service.stream_turn("test-user", "thread-1", "现在几点")]
         return events, fake_agent.run
 
     events, run = asyncio.run(collect())
@@ -126,7 +126,7 @@ def test_stream_interrupt_is_a_json_object(tmp_path: Path):
         fake_agent = _FakeAgent()
         fake_agent.run._interrupts = [{"kind": "clarification", "question": "请补充阈值"}]
         service._agent = fake_agent
-        return [event async for event in service.stream_turn("thread-hitl", "查询超标用户")]
+        return [event async for event in service.stream_turn("test-user", "thread-hitl", "查询超标用户")]
 
     events = asyncio.run(collect())
     interrupt = next(event for event in events if event["event"] == "interrupt")

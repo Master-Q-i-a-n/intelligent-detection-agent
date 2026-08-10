@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CLOSED_EVENT_STATUSES = {"RESOLVED", "CANCELLED"}
 
 
@@ -95,6 +95,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             run_id TEXT PRIMARY KEY,
             camera_id TEXT NOT NULL,
             source_path TEXT,
+            source_sha256 TEXT,
             output_dir TEXT NOT NULL UNIQUE,
             started_at TEXT NOT NULL,
             finished_at TEXT,
@@ -179,6 +180,8 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             identity_status TEXT,
             identity_confidence REAL,
             helmet_status TEXT,
+            gloves_status TEXT,
+            goggles_status TEXT,
             workwear_status TEXT,
             zone_id TEXT,
             created_at TEXT NOT NULL,
@@ -202,6 +205,9 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             ),
             target_visible TEXT,
             helmet_status TEXT,
+            ppe_results_json TEXT CHECK (
+                ppe_results_json IS NULL OR json_valid(ppe_results_json)
+            ),
             evidence_quality TEXT,
             visual_reason TEXT,
             explanation TEXT,
@@ -216,6 +222,19 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             error_json TEXT CHECK (error_json IS NULL OR json_valid(error_json)),
             created_at TEXT NOT NULL,
             FOREIGN KEY (event_id) REFERENCES security_events(event_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS llm_review_claims (
+            source_sha256 TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            provider TEXT,
+            model TEXT,
+            prompt_version TEXT,
+            outcome TEXT NOT NULL CHECK (outcome IN ('CLAIMED','COMPLETED','FAILED')),
+            claimed_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            error_json TEXT CHECK (error_json IS NULL OR json_valid(error_json))
         );
 
         CREATE TABLE IF NOT EXISTS event_evidence (
@@ -277,6 +296,8 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             ON llm_reviews(event_id, reviewed_at DESC);
         CREATE INDEX IF NOT EXISTS idx_reviews_decision
             ON llm_reviews(status, decision);
+        CREATE INDEX IF NOT EXISTS idx_review_claims_event
+            ON llm_review_claims(event_id);
         CREATE INDEX IF NOT EXISTS idx_evidence_event_type
             ON event_evidence(event_id, evidence_type);
         CREATE INDEX IF NOT EXISTS idx_alerts_event_status
@@ -306,6 +327,10 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         """
     )
     _ensure_column(connection, "security_events", "source_system", "TEXT NOT NULL DEFAULT 'yolo_track'")
+    _ensure_column(connection, "analysis_runs", "source_sha256", "TEXT")
+    _ensure_column(connection, "event_people", "gloves_status", "TEXT")
+    _ensure_column(connection, "event_people", "goggles_status", "TEXT")
+    _ensure_column(connection, "llm_reviews", "ppe_results_json", "TEXT")
     _ensure_column(connection, "alert_records", "notification_kind", "TEXT")
     _ensure_column(connection, "alert_records", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(connection, "alert_records", "last_attempt_at", "TEXT")
@@ -317,6 +342,30 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_alert_event_kind "
         "ON alert_records(event_id, channel, notification_kind)"
+    )
+    connection.executescript(
+        """
+        DROP VIEW IF EXISTS v_event_summary;
+        CREATE VIEW v_event_summary AS
+        SELECT
+            event.*,
+            review.attempt_id AS latest_review_attempt_id,
+            review.decision AS latest_review_decision,
+            review.helmet_status AS latest_review_helmet_status,
+            review.ppe_results_json AS latest_review_ppe_results,
+            review.explanation AS latest_review_explanation,
+            review.reviewed_at AS latest_reviewed_at
+        FROM security_events AS event
+        LEFT JOIN llm_reviews AS review
+          ON review.attempt_id = (
+              SELECT candidate.attempt_id
+              FROM llm_reviews AS candidate
+              WHERE candidate.event_id = event.event_id
+                AND candidate.status = 'COMPLETED'
+              ORDER BY candidate.reviewed_at DESC, candidate.created_at DESC
+              LIMIT 1
+          );
+        """
     )
     # 旧版在规则 ACTIVE 时提前标记 NEW；正式告警改为最终决策后才进入待处理。
     connection.execute(
@@ -397,14 +446,15 @@ def upsert_analysis_run(
     connection.execute(
         """
         INSERT INTO analysis_runs(
-            run_id, camera_id, source_path, output_dir, started_at, finished_at, status,
+            run_id, camera_id, source_path, source_sha256, output_dir, started_at, finished_at, status,
             fps, frame_width, frame_height, total_frames, processed_frames,
             model_path, model_sha256, tracker_config, rule_version, config_json,
             annotated_video_path, events_jsonl_path, states_jsonl_path, reviews_jsonl_path,
             error_message, created_at, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(run_id) DO UPDATE SET
             source_path=COALESCE(excluded.source_path, analysis_runs.source_path),
+            source_sha256=COALESCE(excluded.source_sha256, analysis_runs.source_sha256),
             finished_at=COALESCE(excluded.finished_at, analysis_runs.finished_at),
             status=excluded.status,
             fps=COALESCE(excluded.fps, analysis_runs.fps),
@@ -422,6 +472,7 @@ def upsert_analysis_run(
             run_id,
             str(config["camera"]["id"]),
             str(source_path.resolve()) if source_path else None,
+            file_sha256(source_path) if source_path else None,
             str(run_dir.resolve()),
             started_at,
             finished_at,
@@ -451,6 +502,7 @@ def upsert_analysis_run(
 def event_rule_reason(event_type: str) -> str:
     return {
         "NO_HELMET": "近期安全帽佩戴检测比例低于阈值或显式未佩戴比例达到阈值",
+        "PPE_INSPECTION": "整段视频存在安全帽违规或手套、护目镜待复核项",
         "DWELL": "人员在作业区连续停留时间达到阈值",
         "OVER_COUNT": "作业区稳定人员数量超过配置上限",
     }.get(event_type, "规则条件达到配置阈值")
@@ -518,6 +570,10 @@ def upsert_event_transition(
     frame_index = int(record["frame_index"])
     video_seconds = float(record["video_time_seconds"])
     event_type = str(record["event_type"])
+    existing_event = connection.execute(
+        "SELECT final_decision FROM security_events WHERE event_id=?", (event_id,)
+    ).fetchone()
+    already_reviewed = bool(existing_event and existing_event["final_decision"])
     handling_status = "NEW" if status == "ACTIVE" else "NONE"
     activated_frame = frame_index if status == "ACTIVE" else None
     activated_seconds = video_seconds if status == "ACTIVE" else None
@@ -589,13 +645,44 @@ def upsert_event_transition(
             now,
         ),
     )
-    if record.get("track_id") is not None:
+    people = record.get("people") or (record.get("metrics") or {}).get("people") or []
+    if people and not already_reviewed:
+        # 确定性联合事件在重复离线分析时替换规则人员集合；人工/LLM 结论不回退。
+        connection.execute("DELETE FROM event_people WHERE event_id=?", (event_id,))
+        for person in people:
+            connection.execute(
+                """
+                INSERT INTO event_people(
+                    event_id, track_id, person_id, identity_status, identity_confidence,
+                    helmet_status, gloves_status, goggles_status, workwear_status,
+                    zone_id, created_at, updated_at
+                ) VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, NULL, ?, ?, ?)
+                ON CONFLICT(event_id, track_id) DO UPDATE SET
+                    helmet_status=COALESCE(excluded.helmet_status, event_people.helmet_status),
+                    gloves_status=COALESCE(excluded.gloves_status, event_people.gloves_status),
+                    goggles_status=COALESCE(excluded.goggles_status, event_people.goggles_status),
+                    zone_id=COALESCE(excluded.zone_id, event_people.zone_id),
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    event_id,
+                    int(person["track_id"]),
+                    person.get("helmet_status") or person.get("helmet_rule_status"),
+                    person.get("gloves_status") or person.get("gloves_rule_status"),
+                    person.get("goggles_status") or person.get("goggles_rule_status"),
+                    record.get("zone_id"),
+                    now,
+                    now,
+                ),
+            )
+    elif record.get("track_id") is not None and not already_reviewed:
         connection.execute(
             """
             INSERT INTO event_people(
                 event_id, track_id, person_id, identity_status, identity_confidence,
-                helmet_status, workwear_status, zone_id, created_at, updated_at
-            ) VALUES (?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)
+                helmet_status, gloves_status, goggles_status, workwear_status,
+                zone_id, created_at, updated_at
+            ) VALUES (?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)
             ON CONFLICT(event_id, track_id) DO UPDATE SET
                 zone_id=COALESCE(excluded.zone_id, event_people.zone_id),
                 updated_at=excluded.updated_at
@@ -617,6 +704,7 @@ def upsert_llm_review(connection: sqlite3.Connection, record: dict[str, Any]) ->
             "evidence_quality",
             "visual_reason",
             "evidence_timestamps",
+            "people",
         )
     }
     input_value = {
@@ -630,10 +718,10 @@ def upsert_llm_review(connection: sqlite3.Connection, record: dict[str, Any]) ->
         INSERT INTO llm_reviews(
             attempt_id, event_id, status, mode, provider, model, prompt_version,
             prompt_text, reviewed_at, decision, target_visible, helmet_status,
-            evidence_quality, visual_reason, explanation, evidence_timestamps_json,
+            ppe_results_json, evidence_quality, visual_reason, explanation, evidence_timestamps_json,
             input_json, response_json, response_id, usage_json, latency_ms,
             error_json, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(attempt_id) DO UPDATE SET
             status=excluded.status, decision=excluded.decision,
             response_json=excluded.response_json, usage_json=excluded.usage_json,
@@ -652,6 +740,7 @@ def upsert_llm_review(connection: sqlite3.Connection, record: dict[str, Any]) ->
             record.get("decision"),
             record.get("target_visible"),
             record.get("helmet_status"),
+            json_text(record.get("people")) if record.get("people") is not None else None,
             record.get("evidence_quality"),
             record.get("visual_reason"),
             record.get("explanation"),
@@ -665,6 +754,29 @@ def upsert_llm_review(connection: sqlite3.Connection, record: dict[str, Any]) ->
             now,
         ),
     )
+    for person in record.get("people") or []:
+        connection.execute(
+            """
+            INSERT INTO event_people(
+                event_id,track_id,helmet_status,gloves_status,goggles_status,
+                created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(event_id,track_id) DO UPDATE SET
+                helmet_status=excluded.helmet_status,
+                gloves_status=excluded.gloves_status,
+                goggles_status=excluded.goggles_status,
+                updated_at=excluded.updated_at
+            """,
+            (
+                str(record["event_id"]),
+                int(person["track_id"]),
+                person.get("helmet_status"),
+                person.get("gloves_status"),
+                person.get("goggles_status"),
+                now,
+                now,
+            ),
+        )
     clip = (record.get("input_paths") or {}).get("clip")
     if clip:
         insert_evidence(
@@ -674,6 +786,78 @@ def upsert_llm_review(connection: sqlite3.Connection, record: dict[str, Any]) ->
             "REVIEW_VIDEO",
             record.get("clip_metadata"),
         )
+    snapshot = (record.get("input_paths") or {}).get("snapshot")
+    if snapshot:
+        clip_metadata = record.get("clip_metadata") or {}
+        insert_evidence(
+            connection,
+            str(record["event_id"]),
+            str(snapshot),
+            "PPE_ANOMALY_IMAGE",
+            {
+                "video_time_seconds": clip_metadata.get(
+                    "snapshot_video_time_seconds"
+                ),
+                "track_ids": clip_metadata.get("snapshot_track_ids", []),
+            },
+        )
+
+
+def claim_source_review(
+    connection: sqlite3.Connection,
+    *,
+    source_sha256: str,
+    event_id: str,
+    attempt_id: str,
+    provider: str,
+    model: str,
+    prompt_version: str,
+) -> bool:
+    """在模型请求前原子占用源视频；已占用的视频永远不再次调用。"""
+
+    now = utc_now()
+    cursor = connection.execute(
+        """
+        INSERT OR IGNORE INTO llm_review_claims(
+            source_sha256,event_id,attempt_id,provider,model,prompt_version,
+            outcome,claimed_at,updated_at
+        ) VALUES (?,?,?,?,?,?,'CLAIMED',?,?)
+        """,
+        (
+            source_sha256,
+            event_id,
+            attempt_id,
+            provider,
+            model,
+            prompt_version,
+            now,
+            now,
+        ),
+    )
+    return cursor.rowcount == 1
+
+
+def finish_source_review_claim(
+    connection: sqlite3.Connection,
+    source_sha256: str,
+    outcome: str,
+    error: dict[str, Any] | None = None,
+) -> None:
+    if outcome not in {"COMPLETED", "FAILED"}:
+        raise ValueError(f"不支持的复核占用结果: {outcome}")
+    connection.execute(
+        """
+        UPDATE llm_review_claims
+        SET outcome=?,error_json=?,updated_at=?
+        WHERE source_sha256=?
+        """,
+        (
+            outcome,
+            json_text(error) if error is not None else None,
+            utc_now(),
+            source_sha256,
+        ),
+    )
 
 
 def apply_review_decision(connection: sqlite3.Connection, record: dict[str, Any]) -> str | None:
@@ -693,11 +877,13 @@ def apply_review_decision(connection: sqlite3.Connection, record: dict[str, Any]
     event_type = str(event["event_type"])
     severity = {
         "NO_HELMET": "MEDIUM",
+        "PPE_INSPECTION": "MEDIUM",
         "DWELL": "MEDIUM",
         "OVER_COUNT": "HIGH",
     }.get(event_type, "MEDIUM")
     recommended_action = {
         "NO_HELMET": "通知现场负责人核验并立即纠正安全帽佩戴状态。",
+        "PPE_INSPECTION": "通知现场负责人核验并纠正安全帽、手套和护目镜佩戴状态。",
         "DWELL": "核验人员身份和作业任务，确认是否存在非授权滞留。",
         "OVER_COUNT": "核对作业票允许人数并组织现场分流。",
     }.get(event_type, "通知现场负责人核验并记录处置结果。")
@@ -758,7 +944,7 @@ def build_agent_event_payload(
                lifecycle_status,occurred_at,activated_video_seconds,severity,final_decision,
                final_reason,recommended_action,handling_status,
                latest_review_attempt_id,latest_review_helmet_status,
-               latest_review_explanation,latest_reviewed_at
+               latest_review_ppe_results,latest_review_explanation,latest_reviewed_at
         FROM v_event_summary WHERE event_id=?
         """,
         (event_id,),
@@ -777,13 +963,18 @@ def build_agent_event_payload(
             (event_id,),
         ).fetchall()
     ]
-    return {
+    result = {
         "schema_version": 1,
         "alert_id": alert_id,
         "notification_kind": notification_kind,
         **dict(row),
         "evidence": evidence,
     }
+    if result.get("latest_review_ppe_results"):
+        result["latest_review_ppe_results"] = json.loads(
+            str(result["latest_review_ppe_results"])
+        )
+    return result
 
 
 def accept_agent_notification(connection: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
@@ -893,7 +1084,8 @@ def list_security_events(
                e.event_id,e.source_system,e.event_type,e.camera_id,e.zone_id,
                e.primary_track_id,e.lifecycle_status,e.activated_video_seconds,e.occurred_at,
                e.severity,e.final_decision,e.final_reason,e.recommended_action,
-               e.handling_status,v.latest_review_helmet_status,v.latest_review_explanation,
+               e.handling_status,v.latest_review_helmet_status,v.latest_review_ppe_results,
+               v.latest_review_explanation,
                v.latest_reviewed_at,
                (SELECT COUNT(*) FROM event_evidence ev WHERE ev.event_id=e.event_id) evidence_count
         FROM security_events e
@@ -909,7 +1101,13 @@ def list_security_events(
         """,
         values,
     ).fetchall()
-    return [dict(row) for row in rows]
+    results = [dict(row) for row in rows]
+    for item in results:
+        if item.get("latest_review_ppe_results"):
+            item["latest_review_ppe_results"] = json.loads(
+                str(item["latest_review_ppe_results"])
+            )
+    return results
 
 
 def get_security_event(connection: sqlite3.Connection, event_id: str) -> dict[str, Any] | None:
@@ -917,6 +1115,16 @@ def get_security_event(connection: sqlite3.Connection, event_id: str) -> dict[st
     if not items:
         return None
     event = items[0]
+    metrics_row = connection.execute(
+        "SELECT latest_metrics_json FROM security_events WHERE event_id=?",
+        (event_id,),
+    ).fetchone()
+    # 规则指标沿用事件表已有 JSON，不增加字段或执行历史数据迁移。
+    event["yolo_rule_metrics"] = (
+        json.loads(str(metrics_row["latest_metrics_json"]))
+        if metrics_row and metrics_row["latest_metrics_json"]
+        else None
+    )
     event["evidence"] = [
         dict(row)
         for row in connection.execute(
@@ -930,6 +1138,14 @@ def get_security_event(connection: sqlite3.Connection, event_id: str) -> dict[st
         for row in connection.execute(
             "SELECT action_id,action,operator,comment,previous_status,new_status,acted_at "
             "FROM event_handling_actions WHERE event_id=? ORDER BY acted_at",
+            (event_id,),
+        ).fetchall()
+    ]
+    event["people"] = [
+        dict(row)
+        for row in connection.execute(
+            "SELECT track_id,helmet_status,gloves_status,goggles_status,zone_id "
+            "FROM event_people WHERE event_id=? ORDER BY track_id",
             (event_id,),
         ).fetchall()
     ]

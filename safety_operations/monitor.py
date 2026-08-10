@@ -85,6 +85,31 @@ class TrackState:
     ppe_status: str = "OBSERVING"
     active_helmet_event_id: str | None = None
     active_dwell_event_id: str | None = None
+    helmet_seen_worn_at: float | None = None
+    last_helmet_worn_at: float | None = None
+    helmet_violation_at: float | None = None
+    gloves_history: deque[tuple[float, float]] = field(default_factory=deque)
+    goggles_history: deque[tuple[float, float]] = field(default_factory=deque)
+    gloves_status: str = "OBSERVING"
+    goggles_status: str = "OBSERVING"
+    gloves_confirmed_at: float | None = None
+    goggles_confirmed_at: float | None = None
+    gloves_positive_frames: int = 0
+    goggles_positive_frames: int = 0
+    no_gloves_positive_frames: int = 0
+    no_goggle_positive_frames: int = 0
+    gloves_effective_seconds: float = 0.0
+    goggles_effective_seconds: float = 0.0
+    gloves_all_hits: list[tuple[float, float]] = field(default_factory=list)
+    goggles_all_hits: list[tuple[float, float]] = field(default_factory=list)
+    first_no_helmet_at: float | None = None
+    first_bbox: tuple[float, float, float, float] | None = None
+    best_bbox: tuple[float, float, float, float] | None = None
+    bbox_history: list[tuple[float, tuple[float, float, float, float]]] = field(
+        default_factory=list
+    )
+    best_visibility_at: float = 0.0
+    best_bbox_area: float = 0.0
 
 
 @dataclass
@@ -202,18 +227,124 @@ def associate_ppe(
     helmets: list[Detection],
     no_helmets: list[Detection],
     head_height_ratio: float,
-) -> dict[int, dict[str, Detection | None]]:
+    gloves: list[Detection] | None = None,
+    no_gloves: list[Detection] | None = None,
+    goggles: list[Detection] | None = None,
+    no_goggles: list[Detection] | None = None,
+) -> dict[int, dict[str, Detection | list[Detection] | None]]:
     helmet_matches = _associate_one_class(persons, helmets, head_height_ratio)
     no_helmet_matches = _associate_one_class(persons, no_helmets, head_height_ratio)
-    associations: dict[int, dict[str, Detection | None]] = {}
+    goggles_matches = _associate_one_class(persons, goggles or [], head_height_ratio)
+    no_goggle_matches = _associate_one_class(persons, no_goggles or [], head_height_ratio)
+
+    # 一个人可能同时检出两只手套，因此手套按“中心落入人物框 + 最近人物中心”多对一关联。
+    glove_matches = _associate_body_items(persons, gloves or [])
+    no_glove_matches = _associate_body_items(persons, no_gloves or [])
+    associations: dict[int, dict[str, Detection | list[Detection] | None]] = {}
     for person in persons:
         if person.track_id is None:
             continue
         associations[person.track_id] = {
             "helmet": helmet_matches.get(person.track_id),
             "no_helmet": no_helmet_matches.get(person.track_id),
+            "gloves": glove_matches.get(person.track_id, []),
+            "no_gloves": no_glove_matches.get(person.track_id, []),
+            "goggles": goggles_matches.get(person.track_id),
+            "no_goggle": no_goggle_matches.get(person.track_id),
         }
     return associations
+
+
+def _associate_body_items(
+    persons: list[Detection], items: list[Detection]
+) -> dict[int, list[Detection]]:
+    """将人物框内的 PPE 小目标分配给中心距离最近的人物。"""
+
+    matches: dict[int, list[Detection]] = {}
+    for item in items:
+        center_x, center_y = item.center
+        candidates: list[tuple[float, int]] = []
+        for person in persons:
+            if person.track_id is None:
+                continue
+            x1, y1, x2, y2 = person.bbox
+            if not (x1 <= center_x <= x2 and y1 <= center_y <= y2):
+                continue
+            width = max(x2 - x1, 1.0)
+            height = max(y2 - y1, 1.0)
+            person_x = (x1 + x2) / 2
+            person_y = (y1 + y2) / 2
+            distance = math.hypot(
+                (center_x - person_x) / width, (center_y - person_y) / height
+            )
+            candidates.append((distance, person.track_id))
+        if candidates:
+            _, track_id = min(candidates)
+            matches.setdefault(track_id, []).append(item)
+    return matches
+
+
+def positive_evidence_duration(
+    history: deque[tuple[float, float]],
+    now: float,
+    window_seconds: float = 3.0,
+    hold_seconds: float = 0.5,
+) -> tuple[int, float]:
+    """计算最近窗口内命中的帧数，以及每次命中保留后的区间并集时长。"""
+
+    cutoff = now - window_seconds
+    while history and history[0][0] < cutoff:
+        history.popleft()
+    intervals = sorted((timestamp, timestamp + hold_seconds) for timestamp, _ in history)
+    merged: list[list[float]] = []
+    for start, end in intervals:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    duration = sum(end - start for start, end in merged)
+    return len(history), duration
+
+
+def bbox_iou(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    """计算两个人物框的 IoU，供视频结束后的碎片轨迹合并使用。"""
+
+    x1 = max(left[0], right[0])
+    y1 = max(left[1], right[1])
+    x2 = min(left[2], right[2])
+    y2 = min(left[3], right[3])
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    left_area = max(0.0, left[2] - left[0]) * max(0.0, left[3] - left[1])
+    right_area = max(0.0, right[2] - right[0]) * max(0.0, right[3] - right[1])
+    union = left_area + right_area - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def accessory_evidence_from_hits(
+    hits: list[tuple[float, float]],
+    window_seconds: float,
+    hold_seconds: float,
+    min_frames: int,
+    min_duration: float,
+) -> tuple[bool, float, float | None]:
+    """跨碎片轨迹重新累计正向证据，返回是否确认、最大时长和确认时间。"""
+
+    ordered = sorted(hits)
+    maximum = 0.0
+    for timestamp, _ in ordered:
+        window = deque(
+            item for item in ordered if timestamp - window_seconds <= item[0] <= timestamp
+        )
+        frames, duration = positive_evidence_duration(
+            window, timestamp, window_seconds, hold_seconds
+        )
+        maximum = max(maximum, duration)
+        if frames >= min_frames and duration >= min_duration:
+            return True, maximum, timestamp
+    return False, maximum, None
 
 
 def update_zone_membership(
@@ -387,6 +518,7 @@ class SecurityMonitor:
         self.model_path = resolve_config_path(self.config_dir, config["model"]["path"])
         self.show = config["display"]["show"] if show_override is None else show_override
         self.track_states: dict[int, TrackState] = {}
+        self.completed_track_states: dict[int, TrackState] = {}
         self.zone_state = ZoneState(zone_id=str(config["zone"]["id"]))
         self.events: dict[str, EventState] = {}
         self.next_rule_time = 0.0
@@ -403,6 +535,10 @@ class SecurityMonitor:
         self.run_height: int | None = None
         self.run_total_frames: int | None = None
         self.processed_frames = 0
+        self.source_sha256: str | None = None
+        self.raw_accessory_detections: dict[
+            str, list[tuple[float, tuple[float, float, float, float], float]]
+        ] = {"gloves": [], "goggles": [], "no_gloves": [], "no_goggle": []}
         self._font_cache: dict[int, ImageFont.FreeTypeFont] = {}
 
     def _prepare(self) -> tuple[cv2.VideoCapture, YOLO, float, int, int, np.ndarray]:
@@ -410,6 +546,10 @@ class SecurityMonitor:
             raise FileNotFoundError(f"视频不存在: {self.source_path}")
         if not self.model_path.exists():
             raise FileNotFoundError(f"模型不存在: {self.model_path}")
+
+        self.source_sha256 = file_sha256(self.source_path)
+        if not self.source_sha256:
+            raise RuntimeError(f"无法计算源视频 SHA-256: {self.source_path}")
 
         cap = cv2.VideoCapture(str(self.source_path))
         if not cap.isOpened():
@@ -548,7 +688,15 @@ class SecurityMonitor:
     @staticmethod
     def _resolve_class_ids(model: YOLO) -> dict[str, int]:
         name_to_id = {str(name).lower(): int(class_id) for class_id, name in model.names.items()}
-        required = ["person", "helmet", "no_helmet"]
+        required = [
+            "person",
+            "helmet",
+            "no_helmet",
+            "gloves",
+            "no_gloves",
+            "goggles",
+            "no_goggle",
+        ]
         missing = [name for name in required if name not in name_to_id]
         if missing:
             actual = ", ".join(str(name) for name in model.names.values())
@@ -558,13 +706,11 @@ class SecurityMonitor:
     @staticmethod
     def _split_detections(
         result: Any, class_ids: dict[str, int]
-    ) -> tuple[list[Detection], list[Detection], list[Detection]]:
-        persons: list[Detection] = []
-        helmets: list[Detection] = []
-        no_helmets: list[Detection] = []
+    ) -> dict[str, list[Detection]]:
+        detections = {name: [] for name in class_ids}
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
-            return persons, helmets, no_helmets
+            return detections
 
         xyxy = boxes.xyxy.cpu().tolist()
         classes = boxes.cls.int().cpu().tolist()
@@ -581,18 +727,16 @@ class SecurityMonitor:
                 confidence=float(confidence),
                 track_id=int(track_id) if track_id is not None else None,
             )
-            if class_id == class_ids["person"]:
-                persons.append(detection)
-            elif class_id == class_ids["helmet"]:
-                helmets.append(detection)
-            elif class_id == class_ids["no_helmet"]:
-                no_helmets.append(detection)
-        return persons, helmets, no_helmets
+            for name, expected_id in class_ids.items():
+                if class_id == expected_id:
+                    detections[name].append(detection)
+                    break
+        return detections
 
     def _update_tracks(
         self,
         persons: list[Detection],
-        associations: dict[int, dict[str, Detection | None]],
+        associations: dict[int, dict[str, Detection | list[Detection] | None]],
         now: float,
         zone_polygon: np.ndarray,
     ) -> None:
@@ -621,6 +765,10 @@ class SecurityMonitor:
                     person_confidence=person.confidence,
                     foot_point=foot_point,
                     head_roi=head_roi,
+                    first_bbox=person.bbox,
+                    best_bbox=person.bbox,
+                    best_visibility_at=now,
+                    best_bbox_area=max(0.0, (x2 - x1) * (y2 - y1)),
                 )
                 self.track_states[track_id] = state
             else:
@@ -634,8 +782,14 @@ class SecurityMonitor:
                 state.head_roi = head_roi
 
             state.seen_frames += 1
+            state.bbox_history.append((now, person.bbox))
             state.is_missing = False
             state.missing_since = None
+            bbox_area = max(0.0, (x2 - x1) * (y2 - y1))
+            if bbox_area > state.best_bbox_area:
+                state.best_bbox_area = bbox_area
+                state.best_visibility_at = now
+                state.best_bbox = person.bbox
             raw_zone = zone_id if point_in_polygon(foot_point, zone_polygon) else None
             update_zone_membership(
                 state,
@@ -659,9 +813,14 @@ class SecurityMonitor:
             elif helmet is not None:
                 observation = HELMET
                 state.helmet_confidence = helmet.confidence
+                if state.helmet_seen_worn_at is None:
+                    state.helmet_seen_worn_at = now
+                state.last_helmet_worn_at = now
             elif no_helmet is not None:
                 observation = NO_HELMET
                 state.helmet_confidence = no_helmet.confidence
+                if state.first_no_helmet_at is None:
+                    state.first_no_helmet_at = now
             elif head_evaluable:
                 observation = ABSENT
             else:
@@ -669,6 +828,60 @@ class SecurityMonitor:
             add_helmet_observation(
                 state, observation, now, float(helmet_cfg["window_seconds"])
             )
+
+            accessory_cfg = self.config["rules"].get("ppe_accessories", {})
+            window_seconds = float(accessory_cfg.get("window_seconds", 3.0))
+            hold_seconds = float(accessory_cfg.get("hit_hold_seconds", 0.5))
+            min_frames = int(accessory_cfg.get("min_positive_frames", 2))
+            min_duration = float(accessory_cfg.get("min_effective_seconds", 0.5))
+            for key, negative_key in (("gloves", "no_gloves"), ("goggles", "no_goggle")):
+                positive = matched.get(key)
+                if isinstance(positive, list):
+                    positive_items = positive
+                elif isinstance(positive, Detection):
+                    positive_items = [positive]
+                else:
+                    positive_items = []
+                if positive_items:
+                    history = state.gloves_history if key == "gloves" else state.goggles_history
+                    history.append((now, max(item.confidence for item in positive_items)))
+                    all_hits = (
+                        state.gloves_all_hits
+                        if key == "gloves"
+                        else state.goggles_all_hits
+                    )
+                    all_hits.append((now, max(item.confidence for item in positive_items)))
+                    if key == "gloves":
+                        state.gloves_positive_frames += 1
+                    else:
+                        state.goggles_positive_frames += 1
+                    frames, duration = positive_evidence_duration(
+                        history, now, window_seconds, hold_seconds
+                    )
+                    if key == "gloves":
+                        state.gloves_effective_seconds = max(
+                            state.gloves_effective_seconds, duration
+                        )
+                        if frames >= min_frames and duration >= min_duration:
+                            state.gloves_status = "WORN"
+                            state.gloves_confirmed_at = state.gloves_confirmed_at or now
+                    else:
+                        state.goggles_effective_seconds = max(
+                            state.goggles_effective_seconds, duration
+                        )
+                        if frames >= min_frames and duration >= min_duration:
+                            state.goggles_status = "WORN"
+                            state.goggles_confirmed_at = state.goggles_confirmed_at or now
+                negative = matched.get(negative_key)
+                if isinstance(negative, list):
+                    negative_hit = bool(negative)
+                else:
+                    negative_hit = isinstance(negative, Detection)
+                if negative_hit:
+                    if key == "gloves":
+                        state.no_gloves_positive_frames += 1
+                    else:
+                        state.no_goggle_positive_frames += 1
 
         lost_grace = float(tracking_cfg["lost_grace_seconds"])
         for track_id, state in self.track_states.items():
@@ -947,6 +1160,13 @@ class SecurityMonitor:
                     if helmet_event is not None and helmet_event.status not in CLOSED_EVENT_STATUSES
                     else None
                 )
+                if (
+                    helmet_event is not None
+                    and helmet_event.status in {"ACTIVE", "RECOVERING", "RESOLVED"}
+                    and helmet_event.triggered_at is not None
+                ):
+                    if state.helmet_violation_at is None:
+                        state.helmet_violation_at = helmet_event.triggered_at
                 if helmet_event is not None and helmet_event.status in {
                     "PENDING",
                     "ACTIVE",
@@ -964,6 +1184,16 @@ class SecurityMonitor:
                 else:
                     state.ppe_status = "OBSERVING"
 
+                accessory_cfg = self.config["rules"].get("ppe_accessories", {})
+                minimum_visible = float(
+                    accessory_cfg.get("min_person_visible_seconds", 3.0)
+                )
+                if visible_seconds >= minimum_visible:
+                    if state.gloves_status != "WORN":
+                        state.gloves_status = "NEEDS_REVIEW"
+                    if state.goggles_status != "WORN":
+                        state.goggles_status = "NEEDS_REVIEW"
+
         self._write_state_snapshot(frame_index, now)
         expire_seconds = float(tracking_cfg["state_expire_seconds"])
         expired_ids = [
@@ -973,6 +1203,7 @@ class SecurityMonitor:
             and now - state.missing_since > expire_seconds
         ]
         for track_id in expired_ids:
+            self.completed_track_states[track_id] = self.track_states[track_id]
             del self.track_states[track_id]
 
     def _write_state_snapshot(self, frame_index: int, now: float) -> None:
@@ -997,6 +1228,8 @@ class SecurityMonitor:
                     else None,
                     "helmet_evaluable_frames": state.recent_evaluable_frames,
                     "ppe_status": state.ppe_status,
+                    "gloves_status": state.gloves_status,
+                    "goggles_status": state.goggles_status,
                 }
             )
         record = {
@@ -1013,6 +1246,249 @@ class SecurityMonitor:
         }
         self.states_file.write(json.dumps(record, ensure_ascii=False) + "\n")
         self.states_file.flush()
+
+    def _finalize_ppe_inspection(self, frame_index: int, now: float) -> None:
+        """将整段视频的所有人员聚合成唯一 PPE_INSPECTION 事件。"""
+
+        if not self.source_sha256 or frame_index < 0:
+            return
+        all_states = {**self.completed_track_states, **self.track_states}
+        accessory_cfg = self.config["rules"].get("ppe_accessories", {})
+        minimum_visible = float(accessory_cfg.get("min_person_visible_seconds", 3.0))
+        window_seconds = float(accessory_cfg.get("window_seconds", 3.0))
+        hold_seconds = float(accessory_cfg.get("hit_hold_seconds", 0.5))
+        min_frames = int(accessory_cfg.get("min_positive_frames", 2))
+        min_duration = float(accessory_cfg.get("min_effective_seconds", 0.5))
+        if not all_states:
+            return
+
+        # ByteTrack 在遮挡和转身时可能换 ID，也可能对同一人给出短暂重复框。
+        # 合并只用于视频结束后的联合 PPE 复核，不改变实时人数和原始规则事件。
+        parents = {track_id: track_id for track_id in all_states}
+
+        def find(track_id: int) -> int:
+            while parents[track_id] != track_id:
+                parents[track_id] = parents[parents[track_id]]
+                track_id = parents[track_id]
+            return track_id
+
+        def union(left: int, right: int) -> None:
+            left_root, right_root = find(left), find(right)
+            if left_root != right_root:
+                parents[max(left_root, right_root)] = min(left_root, right_root)
+
+        state_items = list(all_states.items())
+        for index, (left_id, left) in enumerate(state_items):
+            for right_id, right in state_items[index + 1 :]:
+                merged = False
+                earlier, later = (left, right)
+                if left.first_seen_at > right.first_seen_at:
+                    earlier, later = right, left
+                gap = later.first_seen_at - earlier.last_seen_at
+                # 相邻碎片的时间和空间位置均连续时，视为同一个人。
+                if (
+                    0.0 <= gap <= 1.5
+                    and earlier.bbox
+                    and later.first_bbox
+                    and bbox_iou(earlier.bbox, later.first_bbox) >= 0.12
+                ):
+                    merged = True
+                if not merged:
+                    left_samples = left.bbox_history[
+                        :: max(1, len(left.bbox_history) // 30)
+                    ]
+                    right_samples = right.bbox_history[
+                        :: max(1, len(right.bbox_history) // 30)
+                    ]
+                    # 同时出现且高度重叠的短轨迹通常是同一人的重复检测。
+                    merged = any(
+                        abs(left_time - right_time) <= 0.15
+                        and bbox_iou(left_bbox, right_bbox) >= 0.5
+                        for left_time, left_bbox in left_samples
+                        for right_time, right_bbox in right_samples
+                    )
+                if merged:
+                    union(left_id, right_id)
+
+        grouped: dict[int, list[TrackState]] = {}
+        for track_id, state in all_states.items():
+            grouped.setdefault(find(track_id), []).append(state)
+
+        people: list[dict[str, Any]] = []
+        group_anchors: list[tuple[float, float, int]] = []
+        for _, states in sorted(grouped.items()):
+            first_seen = min(state.first_seen_at for state in states)
+            last_seen = max(state.last_seen_at for state in states)
+            visible_seconds = max(0.0, last_seen - first_seen)
+            all_boxes = [bbox for state in states for _, bbox in state.bbox_history]
+            if not all_boxes:
+                continue
+            centers = [((box[0] + box[2]) / 2, (box[1] + box[3]) / 2) for box in all_boxes]
+            heights = [max(1.0, box[3] - box[1]) for box in all_boxes]
+            motion = math.hypot(
+                max(point[0] for point in centers) - min(point[0] for point in centers),
+                max(point[1] for point in centers) - min(point[1] for point in centers),
+            ) / (sum(heights) / len(heights))
+            best_state = max(states, key=lambda item: item.best_bbox_area)
+            best_bbox = best_state.best_bbox or best_state.bbox
+            best_aspect = (best_bbox[2] - best_bbox[0]) / max(
+                1.0, best_bbox[3] - best_bbox[1]
+            )
+            has_positive_ppe = any(
+                state.helmet_seen_worn_at is not None
+                or state.first_no_helmet_at is not None
+                or state.gloves_all_hits
+                or state.goggles_all_hits
+                for state in states
+            )
+            # 排除被 Person 类误识别的静态管道大框；真实移动人员仍可进入复核。
+            credible_person = best_aspect <= 0.95 and (
+                has_positive_ppe or motion >= 0.15
+            )
+            if not credible_person or visible_seconds < minimum_visible:
+                continue
+
+            worn_times = [
+                state.helmet_seen_worn_at
+                for state in states
+                if state.helmet_seen_worn_at is not None
+            ]
+            last_worn_times = [
+                state.last_helmet_worn_at
+                for state in states
+                if state.last_helmet_worn_at is not None
+            ]
+            violation_times = [
+                state.helmet_violation_at
+                for state in states
+                if state.helmet_violation_at is not None
+            ]
+            no_helmet_times = [
+                state.first_no_helmet_at
+                for state in states
+                if state.first_no_helmet_at is not None
+            ]
+            helmet_seen_at = min(worn_times) if worn_times else None
+            helmet_last_worn_at = max(last_worn_times) if last_worn_times else None
+            helmet_violation_at = min(violation_times) if violation_times else None
+            first_no_helmet_at = min(no_helmet_times) if no_helmet_times else None
+            if helmet_violation_at is not None:
+                helmet_rule_status = (
+                    "REMOVED_DURING_WORK"
+                    if helmet_seen_at is not None
+                    and helmet_seen_at < helmet_violation_at
+                    else "NOT_WORN"
+                )
+            elif helmet_seen_at is not None:
+                helmet_rule_status = "WORN"
+            else:
+                helmet_rule_status = "UNCERTAIN"
+
+            member_samples = [sample for state in states for sample in state.bbox_history]
+
+            def group_hits(kind: str) -> list[tuple[float, float]]:
+                matched_hits: list[tuple[float, float]] = []
+                for timestamp, item_bbox, confidence in self.raw_accessory_detections[kind]:
+                    center_x = (item_bbox[0] + item_bbox[2]) / 2
+                    center_y = (item_bbox[1] + item_bbox[3]) / 2
+                    if any(
+                        abs(timestamp - person_time) <= 0.15
+                        and person_bbox[0] <= center_x <= person_bbox[2]
+                        and person_bbox[1] <= center_y <= person_bbox[3]
+                        for person_time, person_bbox in member_samples
+                    ):
+                        matched_hits.append((timestamp, confidence))
+                return matched_hits
+
+            glove_hits = group_hits("gloves")
+            goggle_hits = group_hits("goggles")
+            no_glove_hits = group_hits("no_gloves")
+            no_goggle_hits = group_hits("no_goggle")
+            gloves_worn, gloves_duration, gloves_confirmed_at = (
+                accessory_evidence_from_hits(
+                    glove_hits, window_seconds, hold_seconds, min_frames, min_duration
+                )
+            )
+            goggles_worn, goggles_duration, goggles_confirmed_at = (
+                accessory_evidence_from_hits(
+                    goggle_hits, window_seconds, hold_seconds, min_frames, min_duration
+                )
+            )
+            gloves_status = "WORN" if gloves_worn else "NEEDS_REVIEW"
+            goggles_status = "WORN" if goggles_worn else "NEEDS_REVIEW"
+            canonical_track_id = min(state.track_id for state in states)
+            aliases = sorted(state.track_id for state in states)
+            people.append(
+                {
+                    "track_id": canonical_track_id,
+                    "track_ids": aliases,
+                    "visible_seconds": round(visible_seconds, 3),
+                    "helmet_rule_status": helmet_rule_status,
+                    "helmet_seen_worn_at": helmet_seen_at,
+                    "helmet_last_worn_at": helmet_last_worn_at,
+                    "first_no_helmet_at": first_no_helmet_at,
+                    "helmet_violation_at": helmet_violation_at,
+                    "gloves_rule_status": gloves_status,
+                    "goggles_rule_status": goggles_status,
+                    "gloves_positive_frames": len(glove_hits),
+                    "goggles_positive_frames": len(goggle_hits),
+                    "no_gloves_positive_frames": len(no_glove_hits),
+                    "no_goggle_positive_frames": len(no_goggle_hits),
+                    "gloves_effective_seconds": round(gloves_duration, 3),
+                    "goggles_effective_seconds": round(goggles_duration, 3),
+                    "gloves_confirmed_at": gloves_confirmed_at,
+                    "goggles_confirmed_at": goggles_confirmed_at,
+                    "best_visibility_at": round(best_state.best_visibility_at, 3),
+                }
+            )
+            # 摘帽时优先使用首次明确 no_helmet 画面，确保前置片段包含佩戴状态。
+            anchor_time = float(
+                first_no_helmet_at
+                or helmet_violation_at
+                or best_state.best_visibility_at
+            )
+            group_anchors.append((anchor_time, -best_state.best_bbox_area, canonical_track_id))
+
+        has_candidate = any(
+            person["helmet_rule_status"]
+            in {"NOT_WORN", "REMOVED_DURING_WORK", "UNCERTAIN"}
+            or person["gloves_rule_status"] == "NEEDS_REVIEW"
+            or person["goggles_rule_status"] == "NEEDS_REVIEW"
+            for person in people
+        )
+        if not people or not has_candidate:
+            return
+
+        anchor_time, _, anchor_track_id = min(group_anchors)
+
+        event_id = f"PPE_{self.source_sha256[:32]}"
+        event = EventState(
+            event_id=event_id,
+            event_key=f"PPE_INSPECTION:{self.source_sha256}",
+            event_type="PPE_INSPECTION",
+            camera_id=self.camera_id,
+            zone_id=str(self.config["zone"]["id"]),
+            track_id=anchor_track_id,
+            status="ACTIVE",
+            pending_since=anchor_time,
+            triggered_at=anchor_time,
+            last_updated_at=now,
+            metrics={
+                "source_sha256": self.source_sha256,
+                "anchor_track_id": anchor_track_id,
+                "anchor_time_seconds": round(anchor_time, 3),
+                "people": people,
+            },
+            thresholds={
+                "window_seconds": window_seconds,
+                "hit_hold_seconds": hold_seconds,
+                "min_positive_frames": min_frames,
+                "min_effective_seconds": min_duration,
+            },
+        )
+        self.events[event.event_key] = event
+        anchor_frame = int(round(anchor_time * float(self.run_fps or 1.0)))
+        self._write_event(event, min(max(anchor_frame, 0), frame_index), anchor_time)
 
     def _font(self, size: int) -> ImageFont.FreeTypeFont:
         if size not in self._font_cache:
@@ -1213,10 +1689,50 @@ class SecurityMonitor:
         run_error: str | None = None
         try:
             class_ids = self._resolve_class_ids(model)
+            latest_raw_accessories: dict[str, list[Detection]] = {
+                "gloves": [],
+                "goggles": [],
+                "no_gloves": [],
+                "no_goggle": [],
+            }
+
+            def capture_raw_accessories(predictor: Any) -> None:
+                """在 ByteTrack 过滤短时小目标前保留同一次 YOLO 推理的 PPE 框。"""
+
+                for values in latest_raw_accessories.values():
+                    values.clear()
+                if not predictor.results:
+                    return
+                raw_result = predictor.results[0]
+                if raw_result.boxes is None:
+                    return
+                for bbox, class_id, confidence in zip(
+                    raw_result.boxes.xyxy.cpu().tolist(),
+                    raw_result.boxes.cls.int().cpu().tolist(),
+                    raw_result.boxes.conf.cpu().tolist(),
+                ):
+                    for kind in latest_raw_accessories:
+                        if class_id == class_ids[kind]:
+                            latest_raw_accessories[kind].append(
+                                Detection(
+                                    class_id=class_id,
+                                    bbox=tuple(float(value) for value in bbox),
+                                    confidence=float(confidence),
+                                )
+                            )
+                            break
+
+            # 回调注册早于 Ultralytics 的 tracker 回调，因此取得的是原始后处理框，
+            # 没有增加第二次模型推理。
+            model.add_callback("on_predict_postprocess_end", capture_raw_accessories)
             selected_classes = [
                 class_ids["helmet"],
                 class_ids["person"],
                 class_ids["no_helmet"],
+                class_ids["gloves"],
+                class_ids["no_gloves"],
+                class_ids["goggles"],
+                class_ids["no_goggle"],
             ]
             while cap.isOpened():
                 success, frame = cap.read()
@@ -1246,12 +1762,34 @@ class SecurityMonitor:
                     device=configured_device,
                     verbose=False,
                 )[0]
-                persons, helmets, no_helmets = self._split_detections(result, class_ids)
+                detections = self._split_detections(result, class_ids)
+                for kind in ("gloves", "goggles", "no_gloves", "no_goggle"):
+                    self.raw_accessory_detections[kind].extend(
+                        (now, item.bbox, item.confidence)
+                        for item in latest_raw_accessories[kind]
+                    )
+                person_confidence = float(
+                    self.config["model"].get(
+                        "person_confidence", self.config["model"]["confidence"]
+                    )
+                )
+                # Person 使用独立高阈值；小目标 PPE 类别继续保留全局低阈值结果。
+                persons = [
+                    item
+                    for item in detections["person"]
+                    if item.confidence >= person_confidence
+                ]
+                helmets = detections["helmet"]
+                no_helmets = detections["no_helmet"]
                 associations = associate_ppe(
                     persons,
                     helmets,
                     no_helmets,
                     float(self.config["rules"]["helmet"]["head_height_ratio"]),
+                    detections["gloves"],
+                    detections["no_gloves"],
+                    detections["goggles"],
+                    detections["no_goggle"],
                 )
                 self._update_tracks(persons, associations, now, zone_polygon)
 
@@ -1277,6 +1815,7 @@ class SecurityMonitor:
                         print("用户按下 q，提前结束处理。")
                         run_status = "STOPPED"
                         break
+            self._finalize_ppe_inspection(frame_index, max(last_video_time, 0.0))
         except Exception as exc:
             run_status = "FAILED"
             run_error = str(exc)

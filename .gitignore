@@ -55,6 +55,9 @@ source_vibration/
 dataset/
 database/*.duckdb
 database/*.duckdb.wal
+database/*.db
+database/*.db-wal
+database/*.db-shm
 models/**/*.pt
 models/**/*.pth
 agent_inputs/
@@ -75,6 +78,7 @@ reports/
 .DS_Store
 Thumbs.db
 Desktop.ini
+order.txt
 
 database/
 dataset/

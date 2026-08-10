@@ -14,8 +14,8 @@ ROOT = Path(__file__).resolve().parent
 
 import duckdb
 import numpy as np
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -33,6 +33,7 @@ from safety_operations.db import (
     security_overview,
 )
 from conversation_api import create_conversation_router
+from user_store import SESSION_DAYS, UserStore
 
 
 FRONTEND_ROOT = ROOT / "frontend" / "dist"
@@ -42,6 +43,8 @@ INPUT_DB = ROOT / "database" / "gas_ai_input.duckdb"
 SAFETY_ROOT = ROOT / "safety_operations"
 SAFETY_DB = SAFETY_ROOT / "data" / "security.db"
 SAFETY_OUTPUT_ROOT = (SAFETY_ROOT / "outputs").resolve()
+USER_DB = ROOT / "database" / "user_data.db"
+SESSION_COOKIE = "yh_session"
 
 
 def _refresh_parquet_views() -> None:
@@ -77,7 +80,8 @@ def _refresh_parquet_views() -> None:
 _refresh_parquet_views()
 
 app = FastAPI(title="燃气计量与设备健康智能检测平台", version="1.0.0")
-app.include_router(create_conversation_router(ROOT))
+user_store = UserStore(USER_DB)
+app.include_router(create_conversation_router(ROOT, user_store))
 service = SmartMeteringService(use_deep_model=True)
 fast_service = SmartMeteringService(use_deep_model=False)
 inspection_agent = InspectionAgent(ROOT)
@@ -153,6 +157,75 @@ class SecurityActionRequest(BaseModel):
     action: Literal["ACKNOWLEDGE", "START_PROCESSING", "CLOSE"]
     operator: str
     comment: Optional[str] = None
+
+
+class AuthRequest(BaseModel):
+    username: str
+    password: str
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=SESSION_DAYS * 24 * 60 * 60,
+        httponly=True,
+        samesite="lax",
+        secure=os.getenv("AUTH_COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes", "on"},
+        path="/",
+    )
+
+
+@app.middleware("http")
+async def require_platform_login(request: Request, call_next):
+    """静态入口和内部安防接收保持公开，其余平台接口统一要求登录。"""
+
+    path = request.url.path
+    public = (
+        path == "/"
+        or path.startswith("/static/")
+        or path in {"/openapi.json", "/docs", "/redoc", "/auth/login", "/auth/register", "/auth/logout"}
+        or path.startswith("/docs/")
+        or path.startswith("/redoc/")
+        or path.startswith("/internal/security/")
+    )
+    user = user_store.session_user(request.cookies.get(SESSION_COOKIE))
+    request.state.user = user
+    if not public and user is None:
+        return JSONResponse({"detail": "请先登录。"}, status_code=401)
+    return await call_next(request)
+
+
+@app.get("/auth/me")
+def auth_me(request: Request):
+    return request.state.user
+
+
+@app.post("/auth/register")
+def auth_register(payload: AuthRequest, response: Response):
+    try:
+        user = user_store.register(payload.username, payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _set_session_cookie(response, user_store.create_session(user["user_id"]))
+    return user
+
+
+@app.post("/auth/login")
+def auth_login(payload: AuthRequest, response: Response):
+    user = user_store.authenticate(payload.username, payload.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="用户名或密码错误。")
+    _set_session_cookie(response, user_store.create_session(user["user_id"]))
+    return user
+
+
+@app.post("/auth/logout", status_code=204)
+def auth_logout(request: Request, response: Response):
+    user_store.logout(request.cookies.get(SESSION_COOKIE))
+    response.delete_cookie(SESSION_COOKIE, path="/", samesite="lax")
+    response.status_code = 204
+    return response
 
 
 def _load_json(path: Path) -> dict[str, Any]:

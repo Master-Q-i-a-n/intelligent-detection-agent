@@ -7,10 +7,13 @@ import numpy as np
 import pytest
 
 from safety_operations.review import (
+    REVIEW_FUNCTION_NAME,
     ReviewError,
     build_explanation,
+    build_prompt,
     call_ark_review,
     create_review_clip,
+    enforce_rule_facts,
     interpolate_target_bbox,
     load_review_keys,
     parse_review_response,
@@ -80,6 +83,39 @@ def test_create_review_clip_samples_five_fps_and_truncates_end(tmp_path: Path) -
     assert codec.lower() in {"h264", "avc1"}
 
 
+def test_create_review_clip_writes_annotated_anchor_snapshot(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    output = tmp_path / "PPE_hash_review.mp4"
+    snapshot = tmp_path / "PPE_hash_snapshot.jpg"
+    make_video(source, seconds=3.0, fps=10.0)
+
+    metadata = create_review_clip(
+        source,
+        output,
+        trigger_seconds=1.04,
+        pre_seconds=1.0,
+        post_seconds=1.0,
+        output_fps=5.0,
+        max_width=160,
+        target_bbox_timelines={
+            4: [
+                (0.9, (40.0, 20.0, 100.0, 90.0)),
+                (1.1, (42.0, 20.0, 102.0, 90.0)),
+            ]
+        },
+        snapshot_path=snapshot,
+    )
+
+    image = cv2.imread(str(snapshot))
+    assert image is not None
+    assert image.shape[:2] == (120, 160)
+    assert metadata["snapshot_video_time_seconds"] == 1.0
+    assert metadata["snapshot_track_ids"] == [4]
+    # JPEG 有损压缩后颜色会有少量偏差，仅验证存在明显洋红色轨迹标记。
+    magenta = (image[:, :, 0] > 180) & (image[:, :, 1] < 100) & (image[:, :, 2] > 180)
+    assert int(magenta.sum()) > 20
+
+
 def test_create_review_clip_rejects_less_than_two_seconds(tmp_path: Path) -> None:
     source = tmp_path / "short.mp4"
     make_video(source, seconds=1.0, fps=10.0)
@@ -97,22 +133,46 @@ def test_target_bbox_is_interpolated_between_state_snapshots() -> None:
     assert interpolate_target_bbox(timeline, 4.0) is None
 
 
+def test_prompt_requires_all_three_ppe_items_for_every_person() -> None:
+    prompt = build_prompt(
+        {
+            "event_id": "PPE_hash",
+            "event_type": "PPE_INSPECTION",
+            "metrics": {"people": [{"track_id": 4}]},
+            "thresholds": {},
+        },
+        {"start_seconds": 1.0, "duration_seconds": 6.0},
+    )
+
+    assert "三项同等重要" in prompt
+    assert "不得只描述安全帽" in prompt
+    assert "helmet_status、gloves_status、goggles_status 都必须填写" in prompt
+    assert "安全帽：...；手套：...；护目镜：..." in prompt
+    assert "不得仅凭 YOLO 未检出" in prompt
+
+
 def test_parse_function_call_and_build_explanation() -> None:
     arguments = json.dumps(
         {
             "decision": "CONFIRMED",
-            "target_visible": "CLEAR",
-            "helmet_status": "NOT_WORN",
-            "evidence_quality": "GOOD",
-            "visual_reason": "目标头顶清晰可见，未见安全帽。",
-            "evidence_timestamps": [1.0, 2.0],
+            "people": [{
+                "track_id": 7,
+                "helmet_status": "NOT_WORN",
+                "gloves_status": "WORN",
+                "goggles_status": "NOT_WORN",
+                "visibility": "CLEAR",
+                "evidence_quality": "GOOD",
+                "visual_reason": "目标头顶和眼部清晰可见。",
+                "evidence_timestamps": [1.0, 2.0],
+            }],
+            "summary": "目标存在 PPE 佩戴异常。",
         }
     )
     response = SimpleNamespace(
         output=[
             SimpleNamespace(
                 type="function_call",
-                name="submit_no_helmet_review",
+                name=REVIEW_FUNCTION_NAME,
                 arguments=arguments,
             )
         ],
@@ -121,19 +181,16 @@ def test_parse_function_call_and_build_explanation() -> None:
     result = parse_review_response(response)
     explanation = build_explanation(
         {
-            "track_id": 7,
             "metrics": {
-                "helmet_ratio": 0.1,
-                "evaluable_frames": 20,
-                "visible_seconds": 6.2,
+                "people": [{"track_id": 7}],
             },
         },
         result,
     )
     assert result.decision == "CONFIRMED"
-    assert "10.0%" in explanation
-    assert "20 帧" in explanation
-    assert "6.2 秒" in explanation
+    assert "Track 7" in explanation
+    assert "安全帽 NOT_WORN" in explanation
+    assert "护目镜 NOT_WORN" in explanation
 
 
 class FakeFiles:
@@ -160,17 +217,23 @@ class FakeResponses:
             return SimpleNamespace(id="bad", output=[], output_text="not-json", usage=None)
         payload = {
             "decision": "CONFIRMED",
-            "target_visible": "CLEAR",
-            "helmet_status": "NOT_WORN",
-            "evidence_quality": "GOOD",
-            "visual_reason": "连续画面中目标头顶裸露。",
-            "evidence_timestamps": [1.0],
+            "people": [{
+                "track_id": 7,
+                "helmet_status": "NOT_WORN",
+                "gloves_status": "WORN",
+                "goggles_status": "UNCERTAIN",
+                "visibility": "CLEAR",
+                "evidence_quality": "GOOD",
+                "visual_reason": "连续画面中目标头顶裸露。",
+                "evidence_timestamps": [1.0],
+            }],
+            "summary": "存在安全帽异常。",
         }
         if len(self.calls) == 1:
             output = [
                 SimpleNamespace(
                     type="function_call",
-                    name="submit_no_helmet_review",
+                    name=REVIEW_FUNCTION_NAME,
                     arguments=json.dumps(payload),
                 )
             ]
@@ -183,7 +246,7 @@ class FakeResponses:
         )
 
 
-def test_ark_call_uploads_inputs_retries_invalid_json_and_cleans_files(
+def test_ark_call_uploads_once_and_cleans_files(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setattr("safety_operations.review.time.sleep", lambda _: None)
@@ -192,7 +255,7 @@ def test_ark_call_uploads_inputs_retries_invalid_json_and_cleans_files(
         path = tmp_path / name
         path.write_bytes(b"test")
         paths.append(path)
-    client = SimpleNamespace(files=FakeFiles(), responses=FakeResponses(invalid_first=True))
+    client = SimpleNamespace(files=FakeFiles(), responses=FakeResponses())
 
     result, response_id, usage = call_ark_review(
         client=client,
@@ -200,17 +263,16 @@ def test_ark_call_uploads_inputs_retries_invalid_json_and_cleans_files(
         prompt="review",
         video_path=paths[0],
         max_output_tokens=500,
-        retry_count=1,
+        retry_count=0,
         clip_duration_seconds=2.0,
         delete_remote_files=True,
     )
 
     assert result.decision == "CONFIRMED"
-    assert response_id == "resp-2"
+    assert response_id == "resp-1"
     assert usage is None
-    assert len(client.responses.calls) == 2
+    assert len(client.responses.calls) == 1
     assert "tools" in client.responses.calls[0]
-    assert "tools" not in client.responses.calls[1]
     assert [item[:2] for item in client.files.created] == [
         ("clip.mp4", "user_data"),
     ]
@@ -220,3 +282,49 @@ def test_ark_call_uploads_inputs_retries_invalid_json_and_cleans_files(
     first_content = client.responses.calls[0]["input"][0]["content"]
     assert first_content[1]["type"] == "input_video"
     assert client.files.deleted == ["file-1"]
+
+
+def test_invalid_model_response_is_not_retried(tmp_path: Path) -> None:
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"test")
+    responses = FakeResponses(invalid_first=True)
+    client = SimpleNamespace(files=FakeFiles(), responses=responses)
+
+    with pytest.raises(ReviewError) as exc_info:
+        call_ark_review(client, "mini", "review", video, 500, 0, 2.0, True)
+
+    assert exc_info.value.code == "INVALID_MODEL_RESPONSE"
+    assert len(responses.calls) == 1
+
+
+def test_program_confirmed_accessories_cannot_be_overridden() -> None:
+    result = parse_review_response(SimpleNamespace(
+        output=[SimpleNamespace(
+            type="function_call",
+            name=REVIEW_FUNCTION_NAME,
+            arguments=json.dumps({
+                "decision": "CONFIRMED",
+                "people": [{
+                    "track_id": 7,
+                    "helmet_status": "WORN",
+                    "gloves_status": "NOT_WORN",
+                    "goggles_status": "NOT_WORN",
+                    "visibility": "CLEAR",
+                    "evidence_quality": "GOOD",
+                    "visual_reason": "模型判断。",
+                    "evidence_timestamps": [1.0],
+                }],
+                "summary": "模型原始结论。",
+            }),
+        )],
+        output_text="",
+    ))
+    normalized = enforce_rule_facts({"metrics": {"people": [{
+        "track_id": 7,
+        "gloves_rule_status": "WORN",
+        "goggles_rule_status": "WORN",
+    }]}}, result)
+
+    assert normalized.people[0].gloves_status == "WORN"
+    assert normalized.people[0].goggles_status == "WORN"
+    assert normalized.decision == "REJECTED"

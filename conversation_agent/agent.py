@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -22,7 +23,7 @@ from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 from safety_operations.env import load_project_env
@@ -51,6 +52,34 @@ SYSTEM_PROMPT = """
 14. 查询工具返回 SQL_QUERY_ERROR 且 retry_allowed=true 时，根据错误类别重写整条 SQL，最多修正一次；
     retry_allowed=false 时不得继续调用查询工具，应说明查询未完成，不得捏造结果。
 """.strip()
+
+
+class ThreadedSqliteSaver(SqliteSaver):
+    """让同步 SqliteSaver 同时满足 LangGraph 的异步流式 checkpoint 协议。
+
+    官方 SqliteSaver 的异步方法会直接抛 NotImplementedError；这里把同步数据库操作
+    放入工作线程执行。底层 saver 自带线程锁，且连接启用了 check_same_thread=False，
+    因而同步接口、SSE 异步接口和删除操作可以共享同一份用户 checkpoint。
+    """
+
+    async def aget_tuple(self, config):
+        return await asyncio.to_thread(self.get_tuple, config)
+
+    async def alist(self, config, *, filter=None, before=None, limit=None):
+        items = await asyncio.to_thread(
+            lambda: list(self.list(config, filter=filter, before=before, limit=limit))
+        )
+        for item in items:
+            yield item
+
+    async def aput(self, config, checkpoint, metadata, new_versions):
+        return await asyncio.to_thread(self.put, config, checkpoint, metadata, new_versions)
+
+    async def aput_writes(self, config, writes, task_id, task_path=""):
+        await asyncio.to_thread(self.put_writes, config, writes, task_id, task_path)
+
+    async def adelete_thread(self, thread_id):
+        await asyncio.to_thread(self.delete_thread, thread_id)
 
 
 def _content_text(content: Any) -> str:
@@ -136,7 +165,7 @@ def _artifact_progress(artifact: ChatArtifact | None) -> dict[str, Any] | None:
 
 
 class ConversationAgentService:
-    """持有进程内短期会话和 HITL 检查点；不提供跨进程长期记忆。"""
+    """持有按登录用户隔离、可跨进程恢复的对话与 HITL 检查点。"""
 
     def __init__(self, root: Path):
         self.root = root
@@ -150,6 +179,17 @@ class ConversationAgentService:
             or os.getenv("LLM_API_KEY")
         )
         self.provider = (os.getenv("CHAT_LLM_PROVIDER") or ("deepseek" if "deepseek" in self.base_url else "openai-compatible")).lower()
+        os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
+        checkpoint_path = root / "database" / "user_data.db"
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        self._checkpoint_connection = sqlite3.connect(
+            str(checkpoint_path), check_same_thread=False, timeout=10
+        )
+        self._checkpoint_connection.execute("PRAGMA journal_mode=WAL")
+        self._checkpoint_connection.execute("PRAGMA busy_timeout=10000")
+        self._checkpointer = ThreadedSqliteSaver(self._checkpoint_connection)
+        # 启动阶段显式建表，历史接口无需等到第一次模型调用后才具备 checkpoint 结构。
+        self._checkpointer.setup()
         self._agent: Any | None = None
         self._agent_lock = threading.RLock()
         self._thread_locks: dict[str, threading.Lock] = {}
@@ -167,6 +207,12 @@ class ConversationAgentService:
     def _thread_lock(self, thread_id: str) -> threading.Lock:
         with self._thread_locks_guard:
             return self._thread_locks.setdefault(thread_id, threading.Lock())
+
+    @staticmethod
+    def _scoped_thread_id(user_id: str, thread_id: str) -> str:
+        """内部 checkpoint 键加入用户编号，阻断跨用户 thread_id 碰撞。"""
+
+        return f"{user_id}:{thread_id}"
 
     def _build_model(self):
         if not self.configured:
@@ -227,16 +273,17 @@ class ConversationAgentService:
                         "description": "创建工单前请确认标题、优先级、说明和检查清单。",
                     }
                 },
-                checkpointer=InMemorySaver(),
+                checkpointer=self._checkpointer,
                 subagents=[],
                 name="gas-business-conversation-agent",
             )
         return self._agent
 
-    def turn(self, thread_id: str, message: str) -> ChatTurnResponse:
+    def turn(self, user_id: str, thread_id: str, message: str) -> ChatTurnResponse:
         agent = self._get_agent()
-        config = {"configurable": {"thread_id": thread_id}}
-        with self._thread_lock(thread_id):
+        scoped_thread_id = self._scoped_thread_id(user_id, thread_id)
+        config = {"configurable": {"thread_id": scoped_thread_id}}
+        with self._thread_lock(scoped_thread_id):
             output = agent.invoke(
                 {"messages": [{"role": "user", "content": message.strip()}]},
                 config=config,
@@ -244,11 +291,12 @@ class ConversationAgentService:
             )
         return self._response(output)
 
-    def resume(self, request: ChatResumeRequest) -> ChatTurnResponse:
+    def resume(self, user_id: str, request: ChatResumeRequest) -> ChatTurnResponse:
         agent = self._get_agent()
-        config = {"configurable": {"thread_id": request.thread_id}}
+        scoped_thread_id = self._scoped_thread_id(user_id, request.thread_id)
+        config = {"configurable": {"thread_id": scoped_thread_id}}
         command = self._resume_command(request)
-        with self._thread_lock(request.thread_id):
+        with self._thread_lock(scoped_thread_id):
             output = agent.invoke(command, config=config, version="v2")
         return self._response(output)
 
@@ -273,32 +321,34 @@ class ConversationAgentService:
             raise ValueError("工单审批仅支持 approve、edit 或 reject。")
         return Command(resume={"decisions": [decision]})
 
-    async def stream_turn(self, thread_id: str, message: str) -> AsyncIterator[dict[str, Any]]:
+    async def stream_turn(self, user_id: str, thread_id: str, message: str) -> AsyncIterator[dict[str, Any]]:
         """流式执行一轮新消息；事件只暴露安全化进度，不包含隐藏推理。"""
 
         async for event in self._stream_agent(
+            user_id,
             thread_id,
             {"messages": [{"role": "user", "content": message.strip()}]},
         ):
             yield event
 
-    async def stream_resume(self, request: ChatResumeRequest) -> AsyncIterator[dict[str, Any]]:
+    async def stream_resume(self, user_id: str, request: ChatResumeRequest) -> AsyncIterator[dict[str, Any]]:
         """流式恢复补充信息或工单审批中断。"""
 
-        async for event in self._stream_agent(request.thread_id, self._resume_command(request)):
+        async for event in self._stream_agent(user_id, request.thread_id, self._resume_command(request)):
             yield event
 
-    async def _stream_agent(self, thread_id: str, agent_input: Any) -> AsyncIterator[dict[str, Any]]:
+    async def _stream_agent(self, user_id: str, thread_id: str, agent_input: Any) -> AsyncIterator[dict[str, Any]]:
         agent = self._get_agent()
+        scoped_thread_id = self._scoped_thread_id(user_id, thread_id)
         run_uuid = uuid.uuid4()
         config = {
-            "configurable": {"thread_id": thread_id},
+            "configurable": {"thread_id": scoped_thread_id},
             "run_id": run_uuid,
             "run_name": "gas-business-conversation",
             "tags": ["gas-business-chat"],
         }
         queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-        thread_lock = self._thread_lock(thread_id)
+        thread_lock = self._thread_lock(scoped_thread_id)
         run: Any | None = None
         runner: asyncio.Task[None] | None = None
         acquired = False
@@ -447,6 +497,16 @@ class ConversationAgentService:
             finally:
                 if acquired:
                     thread_lock.release()
+
+    def delete_thread(self, user_id: str, thread_id: str) -> None:
+        scoped_thread_id = self._scoped_thread_id(user_id, thread_id)
+        with self._thread_lock(scoped_thread_id):
+            self._checkpointer.delete_thread(scoped_thread_id)
+
+    def close(self) -> None:
+        """应用退出时关闭持久 checkpoint 连接。"""
+
+        self._checkpoint_connection.close()
 
     def _response(self, output: Any) -> ChatTurnResponse:
         value = getattr(output, "value", output)

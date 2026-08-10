@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,9 @@ class DailyDiagnosisDashboard:
         self.cache_root = root / "reports" / "daily_precision_overview_v3"
         self.cache_root.mkdir(parents=True, exist_ok=True)
         self._cache: dict[str, dict[str, Any]] = {}
+        # 同一日期只允许一个线程执行首次全量诊断，其他请求等待并复用其缓存结果。
+        self._overview_locks: dict[str, threading.Lock] = {}
+        self._overview_locks_guard = threading.Lock()
 
     @staticmethod
     def _apply_daily_review_budget(result: dict[str, Any], max_enterprises: int = 5) -> dict[str, Any]:
@@ -169,33 +173,40 @@ class DailyDiagnosisDashboard:
         cache_key = str(target)
         if cache_key in self._cache:
             return self._cache[cache_key]
-        cache_path = self.cache_root / f"{cache_key}.json"
-        if cache_path.exists():
-            result = json.loads(cache_path.read_text(encoding="utf-8"))
+        with self._overview_locks_guard:
+            date_lock = self._overview_locks.setdefault(cache_key, threading.Lock())
+
+        with date_lock:
+            # 等待锁期间，前一个请求可能已经生成了内存或磁盘缓存，因此必须再次检查。
+            if cache_key in self._cache:
+                return self._cache[cache_key]
+            cache_path = self.cache_root / f"{cache_key}.json"
+            if cache_path.exists():
+                result = json.loads(cache_path.read_text(encoding="utf-8"))
+                self._cache[cache_key] = result
+                return result
+            previous_cache = self.root / "reports" / "daily_precision_overview_v2" / f"{cache_key}.json"
+            if previous_cache.exists():
+                result = self._apply_daily_review_budget(json.loads(previous_cache.read_text(encoding="utf-8")))
+                cache_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                self._cache[cache_key] = result
+                return result
+            metering = self._metering_rows(target)
+            equipment = self._equipment_rows(str(target))
+            issues = list(metering.values()) + list(equipment.values())
+            issues.sort(key=lambda x: (-x["risk_score"], x["user_id"], x["module"]))
+            unique = len({x["user_id"] for x in issues})
+            result = {
+                "diagnosis_date": str(target), "status": "completed", "diagnosed_enterprises": 715,
+                "abnormal_enterprises": unique, "normal_enterprises": max(0, 715-unique),
+                "metering_issue_count": len(metering), "equipment_issue_count": len(equipment),
+                "severe_count": sum(x["risk_level"] in ("严重", "高") for x in issues),
+                "issues": issues,
+            }
+            result = self._apply_daily_review_budget(result)
             self._cache[cache_key] = result
-            return result
-        previous_cache = self.root / "reports" / "daily_precision_overview_v2" / f"{cache_key}.json"
-        if previous_cache.exists():
-            result = self._apply_daily_review_budget(json.loads(previous_cache.read_text(encoding="utf-8")))
             cache_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            self._cache[cache_key] = result
             return result
-        metering = self._metering_rows(target)
-        equipment = self._equipment_rows(str(target))
-        issues = list(metering.values()) + list(equipment.values())
-        issues.sort(key=lambda x: (-x["risk_score"], x["user_id"], x["module"]))
-        unique = len({x["user_id"] for x in issues})
-        result = {
-            "diagnosis_date": str(target), "status": "completed", "diagnosed_enterprises": 715,
-            "abnormal_enterprises": unique, "normal_enterprises": max(0, 715-unique),
-            "metering_issue_count": len(metering), "equipment_issue_count": len(equipment),
-            "severe_count": sum(x["risk_level"] in ("严重", "高") for x in issues),
-            "issues": issues,
-        }
-        result = self._apply_daily_review_budget(result)
-        self._cache[cache_key] = result
-        cache_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        return result
 
     def metering_history(self, user_id: str, target: date, days: int = 7) -> list[dict[str, Any]]:
         start = target - timedelta(days=days-1)

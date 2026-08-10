@@ -5,6 +5,7 @@ import { api } from './api'
 
 vi.mock('./api', () => ({
   api: {
+    currentUser: vi.fn(), login: vi.fn(), register: vi.fn(), logout: vi.fn(),
     users: vi.fn(),
     overview: vi.fn(),
     meteringDiagnosis: vi.fn(),
@@ -20,6 +21,7 @@ vi.mock('./api', () => ({
     chatStatus: vi.fn(),
     chatTurn: vi.fn(),
     chatResume: vi.fn(),
+    chatThreads: vi.fn(), chatThread: vi.fn(), deleteChatThread: vi.fn(), chatTurnStream: vi.fn(), chatResumeStream: vi.fn(),
   },
 }))
 
@@ -33,6 +35,7 @@ const diagnosis = {
 }
 
 function prepareApi(range: [string, string] | [] = ['2025-01-11', '2025-01-12']) {
+  vi.mocked(api.currentUser).mockResolvedValue({ user_id: 'usr_admin', username: 'admin' })
   vi.mocked(api.users).mockResolvedValue({
     items: [
       { user_id: 'u1', company_name: '测试企业一', date_range: range as [string, string] },
@@ -50,7 +53,14 @@ function prepareApi(range: [string, string] | [] = ['2025-01-11', '2025-01-12'])
   vi.mocked(api.inspectAgent).mockResolvedValue({ generator: 'llm', conclusion: '检查完成' })
   vi.mocked(api.securityOverview).mockResolvedValue({ total: 0, confirmed: 0, review_required: 0, new_count: 0, processing: 0, high_risk: 0, latest_sequence: 0 })
   vi.mocked(api.securityEvents).mockResolvedValue({ items: [] })
-  vi.mocked(api.chatStatus).mockResolvedValue({ configured: true, provider: 'deepseek', model: 'deepseek-chat', memory: 'in-process-thread-only', tracing_enabled: false })
+  vi.mocked(api.chatStatus).mockResolvedValue({ configured: true, provider: 'deepseek', model: 'deepseek-chat', memory: 'sqlite-user-thread', tracing_enabled: false })
+  vi.mocked(api.chatThreads).mockResolvedValue({ items: [] })
+}
+
+async function openAgentSettings() {
+  fireEvent.click(await screen.findByRole('button', { name: '打开账户菜单' }))
+  fireEvent.click(screen.getByRole('menuitem', { name: /系统设置/ }))
+  return screen.getByRole('switch', { name: 'Agent 自动解读' })
 }
 
 beforeEach(() => {
@@ -64,12 +74,15 @@ afterEach(() => {
 
 describe('Agent 自动调用控制', () => {
   it('初始挂载和重新挂载时开关都关闭', async () => {
+    // 本用例只验证组件会话状态，使用空日期避免业务总览请求干扰重新挂载。
+    prepareApi([])
     const first = render(<App />)
-    const firstSwitch = await screen.findByRole('switch', { name: 'Agent 自动解读' })
+    const firstSwitch = await openAgentSettings()
     expect(firstSwitch).toHaveAttribute('aria-checked', 'false')
     first.unmount()
+    prepareApi([])
     render(<App />)
-    expect(await screen.findByRole('switch', { name: 'Agent 自动解读' })).toHaveAttribute('aria-checked', 'false')
+    expect(await openAgentSettings()).toHaveAttribute('aria-checked', 'false')
   })
 
   it('关闭状态进入计量详情不会调用 Agent，开启后当前键仅调用一次', async () => {
@@ -78,7 +91,7 @@ describe('Agent 自动调用控制', () => {
     expect(await screen.findByText('存在计量偏差')).toBeInTheDocument()
     expect(api.inspectAgent).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByRole('switch', { name: 'Agent 自动解读' }))
+    fireEvent.click(await openAgentSettings())
     await waitFor(() => expect(api.inspectAgent).toHaveBeenCalledTimes(1))
     fireEvent.click(screen.getByRole('button', { name: '刷新诊断证据' }))
     await waitFor(() => expect(api.meteringDiagnosis).toHaveBeenCalledTimes(2))
@@ -89,7 +102,7 @@ describe('Agent 自动调用控制', () => {
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /智能计量详情/ }))
     await screen.findByText('存在计量偏差')
-    fireEvent.click(screen.getByRole('switch', { name: 'Agent 自动解读' }))
+    fireEvent.click(await openAgentSettings())
     await waitFor(() => expect(api.inspectAgent).toHaveBeenCalledTimes(1))
     fireEvent.change(screen.getByLabelText('检测日期'), { target: { value: '2025-01-11' } })
     await waitFor(() => expect(api.inspectAgent).toHaveBeenCalledTimes(2))
@@ -99,7 +112,7 @@ describe('Agent 自动调用控制', () => {
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /智能计量详情/ }))
     await screen.findByText('存在计量偏差')
-    fireEvent.click(screen.getByRole('switch', { name: 'Agent 自动解读' }))
+    fireEvent.click(await openAgentSettings())
     await waitFor(() => expect(api.inspectAgent).toHaveBeenCalledTimes(1))
     fireEvent.change(screen.getByLabelText('检测企业'), { target: { value: 'u2' } })
     await waitFor(() => expect(api.inspectAgent).toHaveBeenCalledTimes(2))
@@ -111,7 +124,16 @@ describe('Agent 自动调用控制', () => {
     await screen.findByText('存在计量偏差')
     fireEvent.click(screen.getByRole('button', { name: '生成智能检查结果' }))
     await waitFor(() => expect(api.inspectAgent).toHaveBeenCalledTimes(1))
-    expect(screen.getByRole('switch', { name: 'Agent 自动解读' })).toHaveAttribute('aria-checked', 'false')
+    expect(await openAgentSettings()).toHaveAttribute('aria-checked', 'false')
+  })
+
+  it('账户菜单提供系统设置和退出登录', async () => {
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: '打开账户菜单' }))
+    expect(screen.getByRole('menuitem', { name: /系统设置/ })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('menuitem', { name: /退出登录/ }))
+    await waitFor(() => expect(api.logout).toHaveBeenCalledTimes(1))
+    expect(await screen.findByRole('heading', { name: '进入曜衡智控平台' })).toBeInTheDocument()
   })
 })
 
@@ -130,11 +152,25 @@ describe('日期和图表边界', () => {
 })
 
 describe('智能问答入口', () => {
-  it('从侧栏进入独立临时对话，不依赖检测日期筛选', async () => {
+  it('从侧栏进入持久化对话，不依赖检测日期筛选', async () => {
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /智能问答/ }))
     expect(await screen.findByText('燃气业务智能问答')).toBeInTheDocument()
     expect(screen.getByRole('textbox', { name: '对话输入' })).toBeEnabled()
     expect(screen.queryByLabelText('检测日期')).not.toBeInTheDocument()
+  })
+})
+
+describe('登录门禁', () => {
+  it('未登录时显示认证页，演示按钮只填入账号不自动提交', async () => {
+    vi.mocked(api.currentUser).mockRejectedValueOnce(new Error('401'))
+    render(<App />)
+    expect(await screen.findByRole('heading', { name: '进入曜衡智控平台' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /填入演示账号/ }))
+    expect(screen.getByRole('textbox', { name: '用户名' })).toHaveValue('admin')
+    expect(screen.getByLabelText('密码')).toHaveValue('123456')
+    expect(api.login).not.toHaveBeenCalled()
+    expect(api.users).not.toHaveBeenCalled()
+    expect(api.securityOverview).not.toHaveBeenCalled()
   })
 })

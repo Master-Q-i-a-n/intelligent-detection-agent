@@ -2,9 +2,14 @@ import json
 from pathlib import Path
 
 from safety_operations.db import (
+    apply_review_decision,
+    claim_source_review,
     connect_database,
+    finish_source_review_claim,
+    get_security_event,
     sanitize_config,
     sync_run_directory,
+    upsert_llm_review,
 )
 
 
@@ -146,6 +151,44 @@ def test_sync_run_is_idempotent_and_keeps_optional_evidence_optional(tmp_path: P
         }
         assert "states" not in tables
         assert "state_snapshots" not in tables
+
+        with connection:
+            apply_review_decision(connection, review_rows[0])
+            connection.execute(
+                "UPDATE alert_records SET status='SENT',sent_at='2026-08-08T00:31:00+08:00' "
+                "WHERE event_id='event-1'"
+            )
+        detail = get_security_event(connection, "event-1")
+        assert detail is not None
+        assert detail["yolo_rule_metrics"] == {"helmet_ratio": 0.0}
+
+        # 截图证据与复核结论解耦：失败记录仍应保留已经生成的异常帧。
+        snapshot = evidence_dir / "PPE_hash_snapshot.jpg"
+        snapshot.write_bytes(b"jpeg-snapshot")
+        with connection:
+            upsert_llm_review(
+                connection,
+                {
+                    "attempt_id": "attempt-failed",
+                    "event_id": "event-1",
+                    "status": "FAILED",
+                    "input_paths": {"snapshot": str(snapshot)},
+                    "clip_metadata": {
+                        "snapshot_video_time_seconds": 2.0,
+                        "snapshot_track_ids": [7],
+                    },
+                    "error": {"code": "API_ERROR", "message": "测试失败"},
+                },
+            )
+        evidence = connection.execute(
+            "SELECT evidence_type,metadata_json FROM event_evidence "
+            "WHERE event_id='event-1' AND evidence_type='PPE_ANOMALY_IMAGE'"
+        ).fetchone()
+        assert evidence is not None
+        assert json.loads(evidence["metadata_json"]) == {
+            "video_time_seconds": 2.0,
+            "track_ids": [7],
+        }
     finally:
         connection.close()
 
@@ -178,5 +221,44 @@ def test_schema_accepts_event_without_zone_or_evidence(tmp_path: Path) -> None:
         sync_run_directory(connection, config, run_dir)
         assert connection.execute("SELECT count(*) FROM security_events").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM event_evidence").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_source_video_review_claim_survives_reconnect(tmp_path: Path) -> None:
+    database = tmp_path / "security.db"
+    connection = connect_database(database)
+    try:
+        with connection:
+            assert claim_source_review(
+                connection,
+                source_sha256="a" * 64,
+                event_id="PPE_event",
+                attempt_id="attempt-1",
+                provider="volcengine_ark",
+                model="doubao-test",
+                prompt_version="ppe_inspection_v1",
+            )
+            finish_source_review_claim(connection, "a" * 64, "FAILED", {"code": "TEST"})
+    finally:
+        connection.close()
+
+    connection = connect_database(database)
+    try:
+        with connection:
+            assert not claim_source_review(
+                connection,
+                source_sha256="a" * 64,
+                event_id="PPE_event_2",
+                attempt_id="attempt-2",
+                provider="volcengine_ark",
+                model="doubao-test",
+                prompt_version="ppe_inspection_v1",
+            )
+        row = connection.execute(
+            "SELECT outcome,attempt_id FROM llm_review_claims WHERE source_sha256=?",
+            ("a" * 64,),
+        ).fetchone()
+        assert tuple(row) == ("FAILED", "attempt-1")
     finally:
         connection.close()

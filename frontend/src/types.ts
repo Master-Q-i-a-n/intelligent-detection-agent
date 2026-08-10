@@ -220,6 +220,35 @@ export interface SecurityAction {
   acted_at: string
 }
 
+export interface PPEPersonRuleMetrics {
+  track_id: number
+  track_ids?: number[]
+  visible_seconds?: number
+  helmet_rule_status?: string
+  helmet_seen_worn_at?: number | null
+  helmet_last_worn_at?: number | null
+  first_no_helmet_at?: number | null
+  helmet_violation_at?: number | null
+  gloves_rule_status?: string
+  goggles_rule_status?: string
+  gloves_positive_frames?: number
+  goggles_positive_frames?: number
+  no_gloves_positive_frames?: number
+  no_goggle_positive_frames?: number
+  gloves_effective_seconds?: number
+  goggles_effective_seconds?: number
+  gloves_confirmed_at?: number | null
+  goggles_confirmed_at?: number | null
+  best_visibility_at?: number | null
+}
+
+export interface PPERuleMetrics {
+  source_sha256?: string
+  anchor_track_id?: number
+  anchor_time_seconds?: number
+  people?: PPEPersonRuleMetrics[]
+}
+
 export interface SecurityEvent {
   notification_sequence: number
   notification_kind: 'CONFIRMED_ALERT' | 'REVIEW_REQUIRED'
@@ -239,11 +268,26 @@ export interface SecurityEvent {
   recommended_action: string | null
   handling_status: SecurityHandlingStatus
   latest_review_helmet_status: string | null
+  latest_review_ppe_results?: SecurityEventPerson[] | null
   latest_review_explanation: string | null
   latest_reviewed_at: string | null
+  yolo_rule_metrics?: PPERuleMetrics | null
   evidence_count: number
   evidence?: SecurityEvidence[]
   actions?: SecurityAction[]
+  people?: SecurityEventPerson[]
+}
+
+export interface SecurityEventPerson {
+  track_id: number
+  helmet_status: string | null
+  gloves_status: string | null
+  goggles_status: string | null
+  zone_id?: string | null
+  visibility?: string
+  evidence_quality?: string
+  visual_reason?: string
+  evidence_timestamps?: number[]
 }
 
 export type ChatArtifactType = 'query_result' | 'report' | 'work_order'
@@ -314,4 +358,35 @@ export interface ChatStatus {
   model: string
   memory: string
   tracing_enabled: boolean
+}
+
+export interface AuthUser {
+  user_id: string
+  username: string
+}
+
+export interface ChatThreadSummary {
+  thread_id: string
+  title: string
+  created_at: string
+  updated_at: string
+  status: 'completed' | 'interrupted' | 'error'
+}
+
+export interface ChatHistoryMessage {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  generator?: string | null
+  artifact_ids: string[]
+  created_at: string
+}
+
+export interface ChatThreadDetail {
+  thread: Omit<ChatThreadSummary, 'status'>
+  messages: ChatHistoryMessage[]
+  artifacts: ChatArtifact[]
+  todos: ChatTodo[]
+  interrupt: ChatInterrupt | null
+  last_error: string | null
 }

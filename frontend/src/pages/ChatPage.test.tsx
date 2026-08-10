@@ -11,6 +11,9 @@ vi.mock('../api', () => ({
     chatResume: vi.fn(),
     chatTurnStream: vi.fn(),
     chatResumeStream: vi.fn(),
+    chatThreads: vi.fn(),
+    chatThread: vi.fn(),
+    deleteChatThread: vi.fn(),
   },
 }))
 
@@ -30,10 +33,37 @@ function resumeStreamResponse(response: ChatTurnResponse) {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  vi.mocked(api.chatStatus).mockResolvedValue({ configured: true, provider: 'deepseek', model: 'deepseek-chat', memory: 'in-process-thread-only', tracing_enabled: false })
+  vi.mocked(api.chatStatus).mockResolvedValue({ configured: true, provider: 'deepseek', model: 'deepseek-chat', memory: 'sqlite-user-thread', tracing_enabled: false })
+  vi.mocked(api.chatThreads).mockResolvedValue({ items: [] })
 })
 
 describe('智能问答页面', () => {
+  it('可以恢复并永久删除当前用户的历史对话', async () => {
+    vi.mocked(api.chatThreads).mockResolvedValue({ items: [{
+      thread_id: 'chat_history', title: '一月用气分析', created_at: '2025-01-01T08:00:00Z',
+      updated_at: '2025-01-02T09:30:00Z', status: 'completed',
+    }] })
+    vi.mocked(api.chatThread).mockResolvedValue({
+      thread: { thread_id: 'chat_history', title: '一月用气分析', created_at: '2025-01-01T08:00:00Z', updated_at: '2025-01-02T09:30:00Z' },
+      messages: [
+        { id: 'm1', role: 'user', content: '分析一月用气', artifact_ids: [], created_at: '2025-01-01T08:00:00Z' },
+        { id: 'm2', role: 'assistant', content: '历史分析已完成。', generator: 'test', artifact_ids: ['q-history'], created_at: '2025-01-01T08:00:05Z' },
+      ],
+      artifacts: [{ type: 'query_result', id: 'q-history', payload: { type: 'query_result', query_id: 'q-history', source: 'business', sql: 'SELECT 1', columns: [], rows: [], row_count: 0, truncated: false, elapsed_ms: 1 } }],
+      todos: [], interrupt: null, last_error: null,
+    })
+    vi.mocked(api.deleteChatThread).mockResolvedValue(undefined)
+    render(<ChatPage />)
+    const historyTitle = await screen.findByText('一月用气分析')
+    fireEvent.click(historyTitle.closest('button') as HTMLButtonElement)
+    expect(await screen.findByText('历史分析已完成。')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '查看 SQL 查询（1）' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '删除对话 一月用气分析' }))
+    fireEvent.click(screen.getByRole('button', { name: '删除' }))
+    await waitFor(() => expect(api.deleteChatThread).toHaveBeenCalledWith('chat_history'))
+    expect(await screen.findByText('已开始新的对话。请告诉我需要查询的对象、时间或报告主题。')).toBeInTheDocument()
+  })
+
   it('SQL 查询不会自动打开面板，可由当前回答按钮打开并隐藏', async () => {
     const response: ChatTurnResponse = {
       status: 'completed', message: '共有2户超过阈值。', generator: 'deepagents:deepseek:deepseek-chat', interrupt: null,
@@ -47,6 +77,8 @@ describe('智能问答页面', () => {
     fireEvent.change(screen.getByRole('textbox', { name: '对话输入' }), { target: { value: '查询超过1000立方米的用户' } })
     fireEvent.click(screen.getByRole('button', { name: '发送' }))
     expect(await screen.findByText('共有2户超过阈值。')).toBeInTheDocument()
+    expect(screen.getByText('deepseek-chat')).toBeInTheDocument()
+    expect(screen.queryByText('deepagents:deepseek:deepseek-chat')).not.toBeInTheDocument()
     expect(screen.queryByRole('region', { name: '数据与报告' })).not.toBeInTheDocument()
     const openSql = screen.getByRole('button', { name: '查看 SQL 查询（1）' })
     fireEvent.click(openSql)
@@ -200,5 +232,23 @@ describe('智能问答页面', () => {
     await screen.findByText('对话 Agent 已就绪')
     expect(screen.queryByText(/临时会话|不保存长期记忆/)).not.toBeInTheDocument()
     expect(screen.queryByText(/工单写入前需要人工确认/)).not.toBeInTheDocument()
+    expect(document.querySelector('.chat-toolbar')?.textContent).not.toContain('新建对话')
+  })
+
+  it('流式回答期间显示三个依次跳动的状态点', async () => {
+    let finish: (() => void) | undefined
+    vi.mocked(api.chatTurnStream).mockImplementation(async (_threadId, _message, onEvent) => new Promise<void>((resolve) => {
+      finish = () => {
+        onEvent({ event: 'done', data: { status: 'completed', message: '回答完成。', generator: 'deepagents:deepseek:deepseek-v4-flash', artifacts: [] } })
+        resolve()
+      }
+    }))
+    render(<ChatPage />)
+    fireEvent.change(screen.getByRole('textbox', { name: '对话输入' }), { target: { value: '你好' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    const dots = await screen.findByLabelText('正在生成')
+    expect(dots.querySelectorAll('i')).toHaveLength(3)
+    await act(async () => finish?.())
+    expect(await screen.findByText('deepseek-v4-flash')).toBeInTheDocument()
   })
 })

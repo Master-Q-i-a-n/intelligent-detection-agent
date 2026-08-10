@@ -14,6 +14,9 @@ import type {
   ChatStreamEvent,
   ChatTurnResponse,
   UserListResponse,
+  AuthUser,
+  ChatThreadDetail,
+  ChatThreadSummary,
 } from './types'
 
 export class ApiError extends Error {
@@ -124,6 +127,16 @@ export async function requestJson<T>(path: string, options: RequestOptions = {})
 }
 
 export const api = {
+  currentUser: (signal?: AbortSignal) => requestJson<AuthUser>('/auth/me', { signal }),
+  login: (username: string, password: string, signal?: AbortSignal) =>
+    requestJson<AuthUser>('/auth/login', {
+      method: 'POST', body: JSON.stringify({ username, password }), signal,
+    }),
+  register: (username: string, password: string, signal?: AbortSignal) =>
+    requestJson<AuthUser>('/auth/register', {
+      method: 'POST', body: JSON.stringify({ username, password }), signal,
+    }),
+  logout: (signal?: AbortSignal) => requestJson<void>('/auth/logout', { method: 'POST', signal }),
   users: (signal?: AbortSignal) => requestJson<UserListResponse>('/api/users', { signal }),
   overview: (date: string, signal?: AbortSignal) =>
     requestJson<DailyOverview>(`/daily/overview/${encodeURIComponent(date)}`, { signal }),
@@ -178,6 +191,11 @@ export const api = {
       { method: 'POST', body: JSON.stringify({ action, operator, comment }) },
     ),
   chatStatus: (signal?: AbortSignal) => requestJson<ChatStatus>('/chat/status', { signal }),
+  chatThreads: (signal?: AbortSignal) => requestJson<{ items: ChatThreadSummary[] }>('/chat/threads', { signal }),
+  chatThread: (threadId: string, signal?: AbortSignal) =>
+    requestJson<ChatThreadDetail>(`/chat/threads/${encodeURIComponent(threadId)}`, { signal }),
+  deleteChatThread: (threadId: string, signal?: AbortSignal) =>
+    requestJson<void>(`/chat/threads/${encodeURIComponent(threadId)}`, { method: 'DELETE', signal }),
   chatTurn: (threadId: string, message: string, signal?: AbortSignal) =>
     requestJson<ChatTurnResponse>('/chat/turns', {
       method: 'POST',

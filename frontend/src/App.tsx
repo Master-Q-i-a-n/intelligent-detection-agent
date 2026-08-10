@@ -8,7 +8,8 @@ import { MeteringPage } from './pages/MeteringPage'
 import { OverviewPage } from './pages/OverviewPage'
 import { SafetyPage } from './pages/SafetyPage'
 import { ChatPage } from './pages/ChatPage'
-import type { PageKey, SecurityEvent, SecurityOverview, UserSummary } from './types'
+import { AuthPage } from './pages/AuthPage'
+import type { AuthUser, PageKey, SecurityEvent, SecurityOverview, UserSummary } from './types'
 
 function datesBetween(range: [string, string] | [] | undefined): string[] {
   if (!range || range.length !== 2 || !range[0] || !range[1]) return []
@@ -23,6 +24,8 @@ function datesBetween(range: [string, string] | [] | undefined): string[] {
 }
 
 export default function App() {
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null)
+  const [authChecking, setAuthChecking] = useState(true)
   const [page, setPage] = useState<PageKey>('overview')
   const [users, setUsers] = useState<UserSummary[]>([])
   const [globalRange, setGlobalRange] = useState<[string, string] | []>([])
@@ -43,6 +46,17 @@ export default function App() {
 
   useEffect(() => {
     const controller = new AbortController()
+    api.currentUser(controller.signal)
+      .then(setCurrentUser)
+      .catch(() => setCurrentUser(null))
+      .finally(() => { if (!controller.signal.aborted) setAuthChecking(false) })
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    if (!currentUser) return
+    const controller = new AbortController()
+    setInitializing(true)
     api.users(controller.signal)
       .then((result) => {
         const nextUsers = result.items || []
@@ -61,7 +75,7 @@ export default function App() {
         if (!controller.signal.aborted) setInitializing(false)
       })
     return () => controller.abort()
-  }, [])
+  }, [currentUser])
 
   const selectedUser = useMemo(() => users.find((user) => user.user_id === userId), [userId, users])
   const dates = useMemo(() => datesBetween(selectedUser?.date_range || globalRange), [globalRange, selectedUser])
@@ -137,6 +151,11 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    if (!currentUser) {
+      securitySequence.current = null
+      setSecurityOverviewState(null)
+      return
+    }
     let active = true
     async function pollSecurity() {
       try {
@@ -164,19 +183,33 @@ export default function App() {
       active = false
       window.clearInterval(timer)
     }
-  }, [])
+  }, [currentUser])
 
   const openIssue = useCallback((nextPage: PageKey, nextUserId: string) => {
     changeUser(nextUserId)
     setPage(nextPage)
   }, [changeUser])
 
-  if (initializing) return <div className="boot-screen"><LoadingState label="正在建立数据链路" /></div>
+  async function logout() {
+    agentControllers.current.forEach((controller) => controller.abort())
+    try {
+      await api.logout()
+    } finally {
+      setCurrentUser(null)
+      setAutoAgentEnabled(false)
+      setAgentRecords({})
+      setUsers([])
+      setPage('overview')
+      setSecurityToast(null)
+    }
+  }
+
+  if (authChecking) return <div className="boot-screen"><LoadingState label="正在验证登录状态" /></div>
 
   return (
     <div className="app-shell">
-      <Sidebar page={page} onPageChange={setPage} autoAgentEnabled={autoAgentEnabled} onAutoAgentChange={changeAutoAgent} safetyBadge={securityOverviewState?.new_count || 0} />
-      <main className="main-shell">
+      <Sidebar page={page} onPageChange={setPage} autoAgentEnabled={autoAgentEnabled} onAutoAgentChange={changeAutoAgent} safetyBadge={securityOverviewState?.new_count || 0} currentUser={currentUser} onLogout={() => void logout()} />
+      {!currentUser ? <AuthPage onAuthenticated={setCurrentUser} /> : initializing ? <div className="boot-screen"><LoadingState label="正在建立数据链路" /></div> : <main className="main-shell">
         <Topbar
           page={page}
           users={users}
@@ -196,12 +229,12 @@ export default function App() {
               {page === 'overview' && <OverviewPage active date={date} refreshToken={refreshToken} onBusyChange={setBusy} onOpenIssue={openIssue} />}
               {page === 'metering' && <MeteringPage active userId={userId} date={date} refreshToken={refreshToken} autoAgentEnabled={autoAgentEnabled} autoRecord={agentRecords[activeAgentKey]} onAutoRequest={requestAutoAgent} onBusyChange={setBusy} />}
               {page === 'equipment' && <EquipmentPage active userId={userId} date={date} refreshToken={refreshToken} autoAgentEnabled={autoAgentEnabled} autoRecord={agentRecords[activeAgentKey]} onAutoRequest={requestAutoAgent} onBusyChange={setBusy} />}
-              {page === 'safety' && <SafetyPage refreshToken={refreshToken} liveSequence={securityOverviewState?.latest_sequence || 0} onBusyChange={setBusy} onChanged={refreshSecurityOverview} />}
+              {page === 'safety' && <SafetyPage refreshToken={refreshToken} liveSequence={securityOverviewState?.latest_sequence || 0} onBusyChange={setBusy} onChanged={refreshSecurityOverview} username={currentUser.username} />}
               {page === 'chat' && <ChatPage />}
             </>
           )}
         </div>
-      </main>
+      </main>}
       {securityToast && (
         <button className="security-toast" type="button" onClick={() => { setPage('safety'); setSecurityToast(null) }} aria-label="打开新安防告警">
           <span>SAFETY ALERT</span>

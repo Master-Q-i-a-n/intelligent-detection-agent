@@ -1,3 +1,7 @@
+from collections import deque
+
+import pytest
+
 from safety_operations.monitor import (
     ABSENT,
     HELMET,
@@ -9,6 +13,7 @@ from safety_operations.monitor import (
     add_helmet_observation,
     advance_event,
     associate_ppe,
+    positive_evidence_duration,
     update_zone_membership,
 )
 
@@ -72,6 +77,33 @@ def test_conflicting_helmet_and_no_helmet_can_be_marked_unknown() -> None:
         else HELMET
     )
     assert observation == UNKNOWN
+
+
+def test_gloves_use_body_box_and_goggles_use_head_roi() -> None:
+    person = Detection(6, (0.0, 0.0, 100.0, 200.0), 0.9, 1)
+    glove = Detection(1, (70.0, 120.0, 90.0, 150.0), 0.8)
+    goggles = Detection(4, (35.0, 18.0, 65.0, 35.0), 0.8)
+    matches = associate_ppe(
+        [person], [], [], 0.35, [glove], [], [goggles], []
+    )
+
+    assert matches[1]["gloves"] == [glove]
+    assert matches[1]["goggles"] == goggles
+
+
+def test_positive_evidence_allows_intermittent_hits_but_requires_two_frames() -> None:
+    history = deque([(1.0, 0.8)])
+    frames, duration = positive_evidence_duration(history, 1.0, 3.0, 0.5)
+    assert frames == 1
+    assert duration == 0.5
+
+    history.append((1.4, 0.7))
+    frames, duration = positive_evidence_duration(history, 1.4, 3.0, 0.5)
+    assert frames == 2
+    assert duration == pytest.approx(0.9)
+
+    frames, _ = positive_evidence_duration(history, 4.5, 3.0, 0.5)
+    assert frames == 0
 
 
 def test_helmet_window_excludes_unknown_and_prunes_old_frames() -> None:

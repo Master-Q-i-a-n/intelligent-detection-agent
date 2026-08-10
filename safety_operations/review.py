@@ -19,7 +19,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from .db import (
     apply_review_decision,
     append_sync_error,
+    claim_source_review,
     connect_database,
+    file_sha256,
+    finish_source_review_claim,
+    insert_evidence,
     sync_run_directory,
     upsert_llm_review,
 )
@@ -27,20 +31,35 @@ from .env import load_project_env
 from .video import create_browser_video_writer
 
 
-PROMPT_VERSION = "no_helmet_v2"
-REVIEW_FUNCTION_NAME = "submit_no_helmet_review"
+PROMPT_VERSION = "ppe_inspection_v2"
+REVIEW_FUNCTION_NAME = "submit_ppe_inspection_review"
 
 
-class ReviewResult(BaseModel):
-    """豆包复核的结构化视觉结论。"""
+class PersonPPEReview(BaseModel):
+    """一次联合复核中单个人员的 PPE 结论。"""
 
     model_config = ConfigDict(extra="forbid")
 
-    decision: Literal["CONFIRMED", "REJECTED", "UNCERTAIN"]
-    target_visible: Literal["CLEAR", "PARTIAL", "NOT_VISIBLE"]
-    helmet_status: Literal["WORN", "NOT_WORN", "UNCERTAIN"]
+    track_id: int
+    helmet_status: Literal[
+        "WORN", "NOT_WORN", "REMOVED_DURING_WORK", "UNCERTAIN"
+    ] = Field(description="安全帽的独立视觉结论，作业中摘下必须返回 REMOVED_DURING_WORK。")
+    gloves_status: Literal["WORN", "NOT_WORN", "UNCERTAIN"] = Field(
+        description="手套的独立结论；只有双手足够清晰时才能判定 NOT_WORN。"
+    )
+    goggles_status: Literal["WORN", "NOT_WORN", "UNCERTAIN"] = Field(
+        description="护目镜的独立结论；只有眼部足够清晰时才能判定 NOT_WORN。"
+    )
+    visibility: Literal["CLEAR", "PARTIAL", "NOT_VISIBLE"]
     evidence_quality: Literal["GOOD", "LIMITED", "POOR"]
-    visual_reason: str = Field(min_length=1, max_length=300)
+    visual_reason: str = Field(
+        min_length=1,
+        max_length=500,
+        description=(
+            "必须依次包含‘安全帽：’‘手套：’‘护目镜：’三个分项，分别说明画面观察、"
+            "遮挡或可见性，任何一项都不得省略。"
+        ),
+    )
     evidence_timestamps: list[float] = Field(default_factory=list)
 
     @field_validator("evidence_timestamps")
@@ -49,6 +68,16 @@ class ReviewResult(BaseModel):
         if any(value < 0 for value in values):
             raise ValueError("证据时间戳不能为负数")
         return values
+
+
+class ReviewResult(BaseModel):
+    """豆包复核的结构化视觉结论。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["CONFIRMED", "REJECTED", "UNCERTAIN"]
+    people: list[PersonPPEReview] = Field(min_length=1)
+    summary: str = Field(min_length=1, max_length=500)
 
 
 class ReviewError(RuntimeError):
@@ -148,6 +177,15 @@ def load_track_bbox_timeline(
     return timeline
 
 
+def load_track_bbox_timelines(
+    states_path: Path, track_ids: list[int]
+) -> dict[int, list[tuple[float, tuple[float, float, float, float]]]]:
+    return {
+        track_id: load_track_bbox_timeline(states_path, track_id)
+        for track_id in track_ids
+    }
+
+
 def interpolate_target_bbox(
     timeline: list[tuple[float, tuple[float, float, float, float]]],
     timestamp: float,
@@ -199,8 +237,13 @@ def create_review_clip(
         tuple[float, tuple[float, float, float, float]]
     ]
     | None = None,
+    target_bbox_timelines: dict[
+        int, list[tuple[float, tuple[float, float, float, float]]]
+    ]
+    | None = None,
+    snapshot_path: Path | None = None,
 ) -> dict[str, Any]:
-    """从原视频顺序采样事件片段，避免依赖本机 FFmpeg。"""
+    """生成复核片段，并可从原视频提取最接近异常锚点的一张标记截图。"""
 
     if not source_path.exists():
         raise ReviewError("SOURCE_NOT_FOUND", f"原视频不存在: {source_path}")
@@ -248,6 +291,58 @@ def create_review_clip(
         next_sample_seconds = start_seconds
         written_frames = 0
         frame_index = start_frame
+        snapshot_frame = None
+        snapshot_seconds: float | None = None
+        snapshot_distance = float("inf")
+
+        def boxes_at(timestamp: float) -> dict[int, tuple[float, float, float, float]]:
+            boxes: dict[int, tuple[float, float, float, float]] = {}
+            if target_bbox_timelines:
+                for track_id, timeline in target_bbox_timelines.items():
+                    bbox = interpolate_target_bbox(timeline, timestamp)
+                    if bbox is not None:
+                        boxes[track_id] = bbox
+            elif target_bbox_timeline:
+                bbox = interpolate_target_bbox(target_bbox_timeline, timestamp)
+                if bbox is not None:
+                    boxes[-1] = bbox
+            return boxes
+
+        def render_annotations(
+            source_frame: Any,
+            boxes: dict[int, tuple[float, float, float, float]],
+        ) -> Any:
+            if (output_width, output_height) != (width, height):
+                rendered = cv2.resize(
+                    source_frame,
+                    (output_width, output_height),
+                    interpolation=cv2.INTER_AREA,
+                )
+            else:
+                rendered = source_frame.copy()
+            for track_id, target_bbox in boxes.items():
+                x1, y1, x2, y2 = (
+                    int(round(value * scale)) for value in target_bbox
+                )
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(output_width - 1, x2), min(output_height - 1, y2)
+                # 视频和截图使用同一套中性轨迹标记，不向模型泄露 PPE 规则结论。
+                cv2.rectangle(rendered, (x1, y1), (x2, y2), (255, 0, 255), 3)
+                label_y = min(output_height - 6, y2 + 22)
+                if label_y <= y2 + 5:
+                    label_y = max(18, y2 - 6)
+                cv2.putText(
+                    rendered,
+                    "TARGET" if track_id < 0 else f"TRACK {track_id}",
+                    (x1, label_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (255, 0, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            return rendered
+
         while frame_index < frame_count:
             success, frame = cap.read()
             if not success:
@@ -255,45 +350,21 @@ def create_review_clip(
             frame_seconds = frame_index / source_fps
             if frame_seconds >= end_seconds:
                 break
+            # 截图按原始视频帧选取，而不是从 5 FPS 复核片段中二次取帧。
+            distance = abs(frame_seconds - trigger_seconds)
+            if snapshot_path is not None and distance < snapshot_distance:
+                snapshot_frame = frame.copy()
+                snapshot_seconds = frame_seconds
+                snapshot_distance = distance
             if frame_seconds + 1e-6 >= next_sample_seconds:
-                target_bbox = (
-                    interpolate_target_bbox(target_bbox_timeline, frame_seconds)
-                    if target_bbox_timeline
-                    else None
-                )
-                if (output_width, output_height) != (width, height):
-                    frame = cv2.resize(
-                        frame, (output_width, output_height), interpolation=cv2.INTER_AREA
-                    )
-                if target_bbox is not None:
-                    x1, y1, x2, y2 = (
-                        int(round(value * scale)) for value in target_bbox
-                    )
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(output_width - 1, x2), min(output_height - 1, y2)
-                    # 仅使用中性目标标记，不向模型泄露安全帽规则结论。
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 255), 3)
-                    label_y = min(output_height - 6, y2 + 22)
-                    if label_y <= y2 + 5:
-                        label_y = max(18, y2 - 6)
-                    cv2.putText(
-                        frame,
-                        "TARGET",
-                        (x1, label_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65,
-                        (255, 0, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-                writer.write(frame)
+                writer.write(render_annotations(frame, boxes_at(frame_seconds)))
                 written_frames += 1
                 next_sample_seconds += 1.0 / output_fps
             frame_index += 1
 
         if written_frames == 0:
             raise ReviewError("CLIP_EMPTY", "复核视频没有写入任何帧。")
-        return {
+        metadata = {
             "start_seconds": round(start_seconds, 3),
             "end_seconds": round(end_seconds, 3),
             "duration_seconds": round(written_frames / output_fps, 3),
@@ -302,6 +373,22 @@ def create_review_clip(
             "width": output_width,
             "height": output_height,
         }
+        if snapshot_path is not None:
+            if snapshot_frame is None or snapshot_seconds is None:
+                raise ReviewError("SNAPSHOT_EMPTY", "异常锚点附近没有可用原始视频帧。")
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            snapshot_boxes = boxes_at(snapshot_seconds)
+            snapshot = render_annotations(snapshot_frame, snapshot_boxes)
+            if not cv2.imwrite(str(snapshot_path), snapshot):
+                raise ReviewError("SNAPSHOT_WRITE_FAILED", f"异常截图写入失败: {snapshot_path}")
+            metadata.update(
+                {
+                    "snapshot_path": str(snapshot_path.resolve()),
+                    "snapshot_video_time_seconds": round(snapshot_seconds, 3),
+                    "snapshot_track_ids": sorted(snapshot_boxes),
+                }
+            )
+        return metadata
     finally:
         cap.release()
         if writer is not None:
@@ -312,7 +399,6 @@ def build_prompt(event: dict[str, Any], clip_metadata: dict[str, Any]) -> str:
     facts = {
         "event_id": event.get("event_id"),
         "event_type": event.get("event_type"),
-        "track_id": event.get("track_id"),
         "camera_id": event.get("camera_id"),
         "zone_id": event.get("zone_id"),
         "activation_video_time_seconds": event.get("video_time_seconds"),
@@ -322,12 +408,27 @@ def build_prompt(event: dict[str, Any], clip_metadata: dict[str, Any]) -> str:
         "clip_duration_seconds": clip_metadata["duration_seconds"],
     }
     return (
-        "你是工业现场安全帽事件复核助手。事件短视频中使用洋红色矩形和 TARGET 标记了唯一目标人员，"
-        "只判断该目标人员，不判断其他人员。该标记只表示复核对象，不代表安全帽结论。\n"
-        "程序提供的轨迹ID、时间、帧数、比例和阈值是确定事实，不得重新估算或修改。\n"
-        "只有安全帽正确戴在目标人员头顶才算佩戴；拿在手里、夹在腋下、挂在身体上或位于附近均算未佩戴。\n"
-        "如果目标身份无法从标注图对应到视频，或头部过小、被遮挡、出画，必须返回 UNCERTAIN。\n"
-        "evidence_timestamps 使用相对短视频开头的秒数。visual_reason 只描述视觉证据，不编造规则数值。\n"
+        "你是工业现场 PPE 佩戴复核助手。短视频用洋红色矩形和 TRACK ID 标出了全部候选人员。"
+        "必须逐一返回事件事实中列出的每个 track_id，不判断未标记人员。标记本身不代表违规。\n"
+        "核心任务：对每个候选人员独立检查安全帽、手套、护目镜三项 PPE。三项同等重要，"
+        "即使安全帽已经明显违规，也必须继续完成手套和护目镜判断，不得只描述安全帽。\n"
+        "程序提供的轨迹、时间和规则累计结果是确定事实，不得重新估算或修改。"
+        "gloves_rule_status 或 goggles_rule_status 已为 WORN 时，必须原样返回 WORN，不得覆盖。\n"
+        "安全帽：只有正确戴在目标人员头顶才算 WORN；拿在手里、夹在腋下、挂在身体上或位于附近均算"
+        " NOT_WORN；先佩戴后在作业中摘下返回 REMOVED_DURING_WORK。\n"
+        "手套：观察目标人员左右手在整段视频中的可见画面。能明确看到手套覆盖手部返回 WORN；只有双手"
+        "足够清晰且能明确看到裸手时才返回 NOT_WORN；手部过小、遮挡、出画或仅短暂可见返回 UNCERTAIN。\n"
+        "护目镜：观察眼部和面部区域。能明确看到护目镜覆盖眼部返回 WORN；只有眼部足够清晰且明确未佩戴"
+        "护目镜时才返回 NOT_WORN；面部过小、侧脸、遮挡或分辨率不足返回 UNCERTAIN。不得仅凭 YOLO 未检出"
+        "或反向类别提示直接判定未佩戴。\n"
+        "每个人的 helmet_status、gloves_status、goggles_status 都必须填写。visual_reason 必须严格按"
+        "‘安全帽：...；手套：...；护目镜：...’的顺序逐项说明画面依据或证据不足原因，不得省略任何一项。"
+        "若手套或护目镜状态因规则确定事实必须保持 WORN，但画面不清楚，也要在对应分项中明确说明"
+        "‘规则已确认 WORN，当前视频可见性有限’，不能假造视觉细节。\n"
+        "每个人的 evidence_timestamps 使用相对短视频开头的秒数。summary 必须概括所有人员的三项 PPE，"
+        "不能只概括触发事件的安全帽。"
+        "全局 decision：任一项 NOT_WORN 或 REMOVED_DURING_WORK 为 CONFIRMED；否则存在 UNCERTAIN 为"
+        " UNCERTAIN；全部合规为 REJECTED。\n"
         "事件事实如下：\n"
         + json.dumps(facts, ensure_ascii=False, indent=2)
     )
@@ -339,7 +440,7 @@ def review_tool_schema() -> dict[str, Any]:
     return {
         "type": "function",
         "name": REVIEW_FUNCTION_NAME,
-        "description": "提交指定人员的安全帽视频复核结论。",
+        "description": "提交整段视频中全部候选人员的 PPE 联合复核结论。",
         "parameters": schema,
     }
 
@@ -363,6 +464,54 @@ def parse_review_response(response: Any) -> ReviewResult:
     if not text:
         raise ValueError("豆包响应中没有 Function Call 或 JSON 文本。")
     return ReviewResult.model_validate_json(text)
+
+
+def enforce_rule_facts(event: dict[str, Any], result: ReviewResult) -> ReviewResult:
+    """锁定程序已确认的正向证据，并按人员最终状态重算全局结论。"""
+
+    rule_people = {
+        int(person["track_id"]): person
+        for person in (event.get("metrics") or {}).get("people", [])
+    }
+    model_people = {person.track_id: person for person in result.people}
+    normalized: list[PersonPPEReview] = []
+    for track_id, facts in rule_people.items():
+        person = model_people.get(track_id)
+        if person is None:
+            person = PersonPPEReview(
+                track_id=track_id,
+                helmet_status="UNCERTAIN",
+                gloves_status="UNCERTAIN",
+                goggles_status="UNCERTAIN",
+                visibility="NOT_VISIBLE",
+                evidence_quality="POOR",
+                visual_reason="模型未返回该候选轨迹，按证据不足处理。",
+                evidence_timestamps=[],
+            )
+        updates: dict[str, Any] = {}
+        if facts.get("gloves_rule_status") == "WORN":
+            updates["gloves_status"] = "WORN"
+        if facts.get("goggles_rule_status") == "WORN":
+            updates["goggles_status"] = "WORN"
+        normalized.append(person.model_copy(update=updates))
+
+    # 事件事实为空仅用于兼容旧测试或历史记录，此时保留模型人员列表。
+    if not normalized:
+        normalized = result.people
+    has_violation = any(
+        person.helmet_status in {"NOT_WORN", "REMOVED_DURING_WORK"}
+        or person.gloves_status == "NOT_WORN"
+        or person.goggles_status == "NOT_WORN"
+        for person in normalized
+    )
+    has_uncertain = any(
+        person.helmet_status == "UNCERTAIN"
+        or person.gloves_status == "UNCERTAIN"
+        or person.goggles_status == "UNCERTAIN"
+        for person in normalized
+    )
+    decision = "CONFIRMED" if has_violation else "UNCERTAIN" if has_uncertain else "REJECTED"
+    return result.model_copy(update={"decision": decision, "people": normalized})
 
 
 def is_retryable_api_error(exc: Exception) -> bool:
@@ -392,6 +541,8 @@ def call_ark_review(
     video_preprocess_fps: float = 2.0,
     file_processing_timeout_seconds: float = 120.0,
 ) -> tuple[ReviewResult, str | None, dict[str, Any] | None]:
+    if retry_count != 0:
+        raise ValueError("PPE 联合复核要求 retry_count 固定为 0。")
     uploaded_ids: list[str] = []
     try:
         for index, path in enumerate((video_path,)):
@@ -427,60 +578,37 @@ def call_ark_review(
                 )
 
         video_id = uploaded_ids[0]
-        last_error: Exception | None = None
-        attempts = retry_count + 1
-        for attempt in range(attempts):
-            strict_json_fallback = attempt > 0
-            request_prompt = prompt
-            kwargs: dict[str, Any] = {}
-            if strict_json_fallback:
-                request_prompt += (
-                    "\n上一次响应未通过结构校验。本次不要调用工具，只返回符合以下 JSON Schema 的 JSON 对象：\n"
-                    + json.dumps(ReviewResult.model_json_schema(), ensure_ascii=False)
-                )
-            else:
-                kwargs["tools"] = [review_tool_schema()]
-                kwargs["tool_choice"] = {
-                    "type": "function",
-                    "name": REVIEW_FUNCTION_NAME,
-                }
-
-            try:
-                response = client.responses.create(
-                    model=model,
-                    store=False,
-                    input=[
-                        {
-                            "type": "message",
-                            "role": "user",
-                            "content": [
-                                {"type": "input_text", "text": request_prompt},
-                                {"type": "input_video", "file_id": video_id},
-                            ],
-                        }
+        response = client.responses.create(
+            model=model,
+            store=False,
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_video", "file_id": video_id},
                     ],
-                    max_output_tokens=max_output_tokens,
-                    extra_body={"thinking": {"type": "disabled"}},
-                    **kwargs,
-                )
-                result = parse_review_response(response)
-                if any(
-                    timestamp > clip_duration_seconds + 0.5
-                    for timestamp in result.evidence_timestamps
-                ):
-                    raise ValueError("证据时间戳超出复核短视频时长。")
-                return result, getattr(response, "id", None), extract_usage(response)
-            except (ValidationError, ValueError) as exc:
-                last_error = exc
-            except Exception as exc:  # SDK 的具体网络异常由下方函数判定是否重试。
-                last_error = exc
-                if not is_retryable_api_error(exc):
-                    raise
-            if attempt + 1 < attempts:
-                time.sleep(1.0)
-
-        assert last_error is not None
-        raise ReviewError("INVALID_MODEL_RESPONSE", str(last_error)) from last_error
+                }
+            ],
+            max_output_tokens=max_output_tokens,
+            extra_body={"thinking": {"type": "disabled"}},
+            tools=[review_tool_schema()],
+            tool_choice={"type": "function", "name": REVIEW_FUNCTION_NAME},
+        )
+        try:
+            result = parse_review_response(response)
+        except (ValidationError, ValueError) as exc:
+            raise ReviewError("INVALID_MODEL_RESPONSE", str(exc)) from exc
+        if any(
+            timestamp > clip_duration_seconds + 0.5
+            for person in result.people
+            for timestamp in person.evidence_timestamps
+        ):
+            raise ReviewError(
+                "INVALID_MODEL_RESPONSE", "证据时间戳超出复核短视频时长。"
+            )
+        return result, getattr(response, "id", None), extract_usage(response)
     finally:
         if delete_remote_files:
             for file_id in uploaded_ids:
@@ -491,21 +619,18 @@ def call_ark_review(
 
 
 def build_explanation(event: dict[str, Any], result: ReviewResult) -> str:
-    metrics = event.get("metrics", {})
-    track_id = event.get("track_id")
-    facts: list[str] = [f"规则检测到 Track {track_id} 疑似未规范佩戴安全帽"]
-    if metrics.get("helmet_ratio") is not None:
-        facts.append(f"近期安全帽检出比例为 {float(metrics['helmet_ratio']):.1%}")
-    if metrics.get("evaluable_frames") is not None:
-        facts.append(f"有效观测 {int(metrics['evaluable_frames'])} 帧")
-    if metrics.get("visible_seconds") is not None:
-        facts.append(f"人员已出现 {float(metrics['visible_seconds']):.1f} 秒")
+    people_text = "；".join(
+        f"Track {person.track_id}：安全帽 {person.helmet_status}、"
+        f"手套 {person.gloves_status}、护目镜 {person.goggles_status}，"
+        f"{person.visual_reason}"
+        for person in result.people
+    )
     decision_text = {
-        "CONFIRMED": "豆包视频复核确认该视觉证据支持未佩戴安全帽",
-        "REJECTED": "豆包视频复核未支持该违规，观察到目标已佩戴安全帽",
-        "UNCERTAIN": "豆包视频复核认为当前证据不足，无法确认是否佩戴安全帽",
+        "CONFIRMED": "联合复核确认存在 PPE 佩戴异常",
+        "REJECTED": "联合复核确认候选人员 PPE 均合规",
+        "UNCERTAIN": "联合复核仍有 PPE 项目证据不足",
     }[result.decision]
-    return "，".join(facts) + f"。{decision_text}：{result.visual_reason}。"
+    return f"{decision_text}。{people_text}。"
 
 
 def append_jsonl(path: Path, record: dict[str, Any]) -> None:
@@ -521,9 +646,10 @@ def make_base_record(
     input_paths: dict[str, str],
     provider: str | None = None,
     prompt_text: str | None = None,
+    attempt_id: str | None = None,
 ) -> dict[str, Any]:
     return {
-        "attempt_id": uuid.uuid4().hex,
+        "attempt_id": attempt_id or uuid.uuid4().hex,
         "event_id": event.get("event_id"),
         "event_type": event.get("event_type"),
         "camera_id": event.get("camera_id"),
@@ -585,12 +711,14 @@ def run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
-    event_types = {str(value) for value in review_cfg.get("event_types", ["NO_HELMET"])}
+    event_types = {
+        str(value) for value in review_cfg.get("event_types", ["PPE_INSPECTION"])
+    }
     active_events = select_active_events(events, event_types)
     if not active_events:
         if db_connection is not None:
             db_connection.close()
-        print("没有需要复核的 ACTIVE NO_HELMET 事件。")
+        print("没有需要复核的 ACTIVE PPE_INSPECTION 事件。")
         return 0
 
     model_env = str(review_cfg.get("model_env", "ARK_MODEL_ID"))
@@ -608,13 +736,13 @@ def run(args: argparse.Namespace) -> int:
     pending_events = [
         event
         for event in active_events
-        if args.force
-        or (str(event["event_id"]), idempotency_model, prompt_version) not in reviewed_keys
+        if (str(event["event_id"]), idempotency_model, prompt_version)
+        not in reviewed_keys
     ]
     if not pending_events:
         if db_connection is not None:
             db_connection.close()
-        print("所有匹配事件均已复核；使用 --force 可重新执行。")
+        print("所有匹配事件均已有复核记录。")
         return 0
 
     api_key = str(review_cfg.get("api_key") or "").strip() or os.getenv(
@@ -641,21 +769,51 @@ def run(args: argparse.Namespace) -> int:
     for event in pending_events:
         event_id = str(event["event_id"])
         clip_path = (evidence_dir / f"{event_id}_review.mp4").resolve()
+        snapshot_path = (evidence_dir / f"{event_id}_snapshot.jpg").resolve()
         input_paths: dict[str, str] = {
             "source": str(source_path),
             "clip": str(clip_path),
+            "snapshot": str(snapshot_path),
         }
         started = time.perf_counter()
         prompt_text: str | None = None
+        source_hash = str((event.get("metrics") or {}).get("source_sha256") or "")
+        if not source_hash:
+            source_hash = str(file_sha256(source_path) or "")
+        attempt_id = uuid.uuid4().hex
+        claimed = False
         try:
-            track_id = event.get("track_id")
-            if track_id is None:
+            people_facts = (event.get("metrics") or {}).get("people") or []
+            track_ids = [int(person["track_id"]) for person in people_facts]
+            if not track_ids:
                 raise ReviewError(
-                    "MISSING_TARGET_TRACK_ID", "NO_HELMET 事件缺少 track_id。"
+                    "MISSING_TARGET_TRACK_ID", "PPE_INSPECTION 事件缺少候选人员。"
                 )
-            target_timeline = load_track_bbox_timeline(
-                run_dir / "states.jsonl", int(track_id)
-            )
+            target_timelines: dict[
+                int, list[tuple[float, tuple[float, float, float, float]]]
+            ] = {}
+            for person in people_facts:
+                canonical_id = int(person["track_id"])
+                aliases = [int(value) for value in person.get("track_ids", [canonical_id])]
+                merged_timeline = []
+                for alias in aliases:
+                    try:
+                        merged_timeline.extend(
+                            load_track_bbox_timeline(
+                                run_dir / "states.jsonl", alias
+                            )
+                        )
+                    except ReviewError as exc:
+                        if exc.code != "MISSING_TARGET_TRACK_HISTORY":
+                            raise
+                if not merged_timeline:
+                    raise ReviewError(
+                        "MISSING_TARGET_TRACK_HISTORY",
+                        f"候选人员 Track {canonical_id} 没有可用人物框。",
+                    )
+                target_timelines[canonical_id] = sorted(
+                    merged_timeline, key=lambda item: item[0]
+                )
             clip_metadata = create_review_clip(
                 source_path=source_path,
                 output_path=clip_path,
@@ -664,8 +822,24 @@ def run(args: argparse.Namespace) -> int:
                 post_seconds=float(review_cfg.get("post_seconds", 2.0)),
                 output_fps=float(review_cfg.get("clip_fps", 5.0)),
                 max_width=int(review_cfg.get("max_clip_width", 1280)),
-                target_bbox_timeline=target_timeline,
+                target_bbox_timelines=target_timelines,
+                snapshot_path=snapshot_path,
             )
+            # 截图先于豆包调用独立入库，后续网络或结构化解析失败也不会丢失证据。
+            if db_connection is not None:
+                with db_connection:
+                    insert_evidence(
+                        db_connection,
+                        event_id,
+                        snapshot_path,
+                        "PPE_ANOMALY_IMAGE",
+                        {
+                            "video_time_seconds": clip_metadata.get(
+                                "snapshot_video_time_seconds"
+                            ),
+                            "track_ids": clip_metadata.get("snapshot_track_ids", []),
+                        },
+                    )
             if args.prepare_only:
                 print(
                     f"已准备事件 {event_id}: {clip_path} "
@@ -675,13 +849,36 @@ def run(args: argparse.Namespace) -> int:
 
             assert client is not None
             prompt_text = build_prompt(event, clip_metadata)
+            if db_connection is None:
+                raise ReviewError(
+                    "REVIEW_CLAIM_DATABASE_REQUIRED",
+                    "单次复核保护要求 security.db 可用，已阻止模型调用。",
+                )
+            if not source_hash:
+                raise ReviewError("SOURCE_HASH_MISSING", "无法取得源视频 SHA-256。")
+
+            # 占用先提交，再上传和调用；即使进程随后退出，同一源视频也不能再次调用。
+            with db_connection:
+                claimed = claim_source_review(
+                    db_connection,
+                    source_sha256=source_hash,
+                    event_id=event_id,
+                    attempt_id=attempt_id,
+                    provider=provider,
+                    model=model,
+                    prompt_version=prompt_version,
+                )
+            if not claimed:
+                print(f"源视频 {source_hash[:12]} 已占用复核，本次跳过模型调用。")
+                continue
+
             result, response_id, usage = call_ark_review(
                 client=client,
                 model=model,
                 prompt=prompt_text,
                 video_path=clip_path,
                 max_output_tokens=int(review_cfg.get("max_output_tokens", 500)),
-                retry_count=int(review_cfg.get("retry_count", 1)),
+                retry_count=0,
                 clip_duration_seconds=float(clip_metadata["duration_seconds"]),
                 delete_remote_files=bool(review_cfg.get("delete_remote_files", True)),
                 video_preprocess_fps=float(
@@ -691,13 +888,29 @@ def run(args: argparse.Namespace) -> int:
                     review_cfg.get("file_processing_timeout_seconds", 120.0)
                 ),
             )
+            result = enforce_rule_facts(event, result)
             record = make_base_record(
-                event, model, prompt_version, input_paths, provider, prompt_text
+                event,
+                model,
+                prompt_version,
+                input_paths,
+                provider,
+                prompt_text,
+                attempt_id,
             )
             record.update(
                 {
                     "status": "COMPLETED",
-                    **result.model_dump(),
+                    "decision": result.decision,
+                    "people": [person.model_dump() for person in result.people],
+                    "visual_reason": result.summary,
+                    "evidence_timestamps": sorted(
+                        {
+                            timestamp
+                            for person in result.people
+                            for timestamp in person.evidence_timestamps
+                        }
+                    ),
                     "explanation": build_explanation(event, result),
                     "clip_metadata": clip_metadata,
                     "response_id": response_id,
@@ -713,6 +926,9 @@ def run(args: argparse.Namespace) -> int:
                         upsert_llm_review(db_connection, record)
                         if review_cfg.get("mode") == "active":
                             apply_review_decision(db_connection, record)
+                        finish_source_review_claim(
+                            db_connection, source_hash, "COMPLETED"
+                        )
                 except Exception as exc:
                     db_connection.rollback()
                     append_sync_error(run_dir, "UPSERT_REVIEW", record["attempt_id"], exc)
@@ -731,6 +947,7 @@ def run(args: argparse.Namespace) -> int:
                 input_paths,
                 provider,
                 prompt_text,
+                attempt_id,
             )
             record.update(
                 {
@@ -746,6 +963,13 @@ def run(args: argparse.Namespace) -> int:
                     try:
                         with db_connection:
                             upsert_llm_review(db_connection, record)
+                            if claimed and source_hash:
+                                finish_source_review_claim(
+                                    db_connection,
+                                    source_hash,
+                                    "FAILED",
+                                    record["error"],
+                                )
                     except Exception as db_exc:
                         db_connection.rollback()
                         append_sync_error(
@@ -781,7 +1005,7 @@ def review_run_directory(config_path: Path, run_dir: Path, source_path: Path) ->
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Doubao NO_HELMET 视频影子复核")
+    parser = argparse.ArgumentParser(description="Doubao PPE 联合视频复核")
     parser.add_argument("--config", default="config.yaml", help="YAML 配置文件路径")
     parser.add_argument("--run-dir", required=True, help="包含 events.jsonl 的 YOLO 运行目录")
     parser.add_argument("--source", help="覆盖 camera.source 的原始视频路径")
@@ -789,7 +1013,7 @@ def parse_args() -> argparse.Namespace:
         "--prepare-only", action="store_true", help="只生成复核短视频，不调用方舟接口"
     )
     parser.add_argument(
-        "--force", action="store_true", help="忽略已有复核记录，重新执行并产生新 attempt_id"
+        "--force", action="store_true", help="保留兼容参数；源视频级单次占用不可绕过"
     )
     return parser.parse_args()
 

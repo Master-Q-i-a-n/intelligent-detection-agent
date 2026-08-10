@@ -1,8 +1,0 @@
-.\start_api.ps1
-
-npm --prefix frontend run dev
-
-uv run python -m safety_operations.review `
-  --config .\safety_operations\config.yaml `
-  --run-dir .\safety_operations\outputs\run_20260808_235959 `
-  --source .\safety_operations\data\中途脱帽.mp4

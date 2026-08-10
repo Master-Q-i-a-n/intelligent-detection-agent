@@ -5,7 +5,7 @@ import type { EChartsOption } from 'echarts'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api } from '../api'
-import type { ChatArtifact, ChatArtifactType, ChatInterrupt, ChatStreamEvent, ChatTodo, ChatTurnResponse } from '../types'
+import type { ChatArtifact, ChatArtifactType, ChatInterrupt, ChatStreamEvent, ChatThreadSummary, ChatTodo, ChatTurnResponse } from '../types'
 
 interface DisplayMessage {
   id: string
@@ -52,6 +52,11 @@ interface ReportPayload {
 
 function newThreadId(): string {
   return `chat_${crypto.randomUUID().replaceAll('-', '')}`
+}
+
+function generatorLabel(generator: string): string {
+  // 后端保留完整 provider 链路用于追踪，界面只显示用户关心的最终模型名。
+  return generator.split(':').filter(Boolean).at(-1) || generator
 }
 
 function isNarrowViewport(): boolean {
@@ -248,6 +253,11 @@ export function ChatPage() {
   const [selectedArtifactIds, setSelectedArtifactIds] = useState<string[]>([])
   const [narrowPanel, setNarrowPanel] = useState(isNarrowViewport)
   const [splitPercent, setSplitPercent] = useState(44)
+  const [threads, setThreads] = useState<ChatThreadSummary[]>([])
+  const [historyOpen, setHistoryOpen] = useState(true)
+  const [historyLoading, setHistoryLoading] = useState(true)
+  const [historyError, setHistoryError] = useState('')
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null)
   const controllerRef = useRef<AbortController | null>(null)
   const messageEndRef = useRef<HTMLDivElement | null>(null)
   const workspaceRef = useRef<HTMLDivElement | null>(null)
@@ -265,6 +275,12 @@ export function ChatPage() {
   useEffect(() => {
     const controller = new AbortController()
     api.chatStatus(controller.signal).then((status) => setConfigured(status.configured)).catch(() => setConfigured(false))
+    api.chatThreads(controller.signal)
+      .then((result) => setThreads(result.items || []))
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) setHistoryError(reason instanceof Error ? reason.message : '历史对话读取失败')
+      })
+      .finally(() => { if (!controller.signal.aborted) setHistoryLoading(false) })
     return () => controller.abort()
   }, [])
 
@@ -385,6 +401,72 @@ export function ChatPage() {
     setInterruptState(nextInterrupt)
   }
 
+  async function refreshHistory() {
+    try {
+      const result = await api.chatThreads()
+      setThreads(result.items || [])
+      setHistoryError('')
+    } catch (reason) {
+      setHistoryError(reason instanceof Error ? reason.message : '历史对话刷新失败')
+    }
+  }
+
+  async function openHistoryThread(nextThreadId: string) {
+    if (nextThreadId === threadId) return
+    controllerRef.current?.abort()
+    requestTokenRef.current += 1
+    clearStreamingText()
+    setHistoryLoading(true)
+    setBusy(false)
+    setHistoryError('')
+    try {
+      const detail = await api.chatThread(nextThreadId)
+      setThreadId(detail.thread.thread_id)
+      setMessages(detail.messages.map((message) => ({
+        id: message.id,
+        role: message.role,
+        content: message.content,
+        generator: message.generator || undefined,
+        artifactIds: message.artifact_ids || [],
+      })))
+      setArtifacts(Object.fromEntries(detail.artifacts.map((artifact) => [artifact.id, artifact])))
+      setTodos(detail.todos || [])
+      setTodoOpen(false)
+      todoWasShownRef.current = (detail.todos || []).length > 0
+      setInterruptState(detail.interrupt || null)
+      if (detail.interrupt?.kind === 'work_order_approval') {
+        const args = detail.interrupt.action?.arguments || detail.interrupt.action?.args || {}
+        setEditText(JSON.stringify(args, null, 2))
+      } else {
+        setEditText('')
+      }
+      setResumeText('')
+      setInput('')
+      setError(detail.last_error || '')
+      setPanelOpen(false)
+      setSelectedArtifactIds([])
+      seenArtifactIdsRef.current = new Set(detail.artifacts.map((artifact) => artifact.id))
+      if (isNarrowViewport()) setHistoryOpen(false)
+    } catch (reason) {
+      setHistoryError(reason instanceof Error ? reason.message : '历史对话打开失败')
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
+
+  async function deleteHistoryThread(nextThreadId: string) {
+    if (busy) return
+    setHistoryError('')
+    try {
+      await api.deleteChatThread(nextThreadId)
+      setDeleteConfirmId(null)
+      if (nextThreadId === threadId) resetConversation()
+      await refreshHistory()
+    } catch (reason) {
+      setHistoryError(reason instanceof Error ? reason.message : '历史对话删除失败')
+    }
+  }
+
   function handleStreamEvent(streamEvent: ChatStreamEvent, requestToken: number) {
     if (requestTokenRef.current !== requestToken) return
     const data = streamEvent.data
@@ -439,6 +521,7 @@ export function ChatPage() {
         controllerRef.current = null
         setBusy(false)
       }
+      if (!controller.signal.aborted) await refreshHistory()
     }
     return completed
   }
@@ -504,6 +587,7 @@ export function ChatPage() {
     clearStreamingText()
     todoWasShownRef.current = false
     seenArtifactIdsRef.current.clear()
+    setDeleteConfirmId(null)
   }
 
   function openArtifactPanel(message: DisplayMessage, type: ChatArtifactType, trigger: HTMLButtonElement) {
@@ -557,12 +641,36 @@ export function ChatPage() {
   }
 
   return (
-    <div className={panelOpen ? 'chat-workspace with-evidence' : 'chat-workspace'} ref={workspaceRef} style={{ '--chat-left': `${splitPercent}%` } as CSSProperties}>
+    <div className={historyOpen ? 'chat-page-shell history-open' : 'chat-page-shell history-collapsed'}>
+      <aside className={historyOpen ? 'chat-history-panel open' : 'chat-history-panel'} aria-label="历史对话">
+        <header>
+          {historyOpen && <div><small>CONVERSATIONS</small><strong>历史对话</strong></div>}
+          <button type="button" aria-label={historyOpen ? '收起历史对话' : '展开历史对话'} onClick={() => setHistoryOpen((value) => !value)}>{historyOpen ? '‹' : '›'}</button>
+        </header>
+        {historyOpen && <>
+          <button className="chat-history-new" type="button" onClick={resetConversation}>＋ 新建对话</button>
+          <div className="chat-history-list">
+            {historyLoading && <p className="chat-history-state">正在读取历史…</p>}
+            {!historyLoading && !threads.length && <p className="chat-history-state">还没有历史对话</p>}
+            {threads.map((thread) => <article className={thread.thread_id === threadId ? 'active' : ''} key={thread.thread_id}>
+              <button className="chat-history-open" type="button" onClick={() => void openHistoryThread(thread.thread_id)}>
+                <strong title={thread.title}>{thread.title}</strong>
+                <small>{new Date(thread.updated_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</small>
+                {thread.status !== 'completed' && <span className={`thread-status ${thread.status}`}>{thread.status === 'interrupted' ? '待确认' : '执行失败'}</span>}
+              </button>
+              {deleteConfirmId === thread.thread_id ? <div className="chat-history-confirm"><span>永久删除？</span><button type="button" onClick={() => void deleteHistoryThread(thread.thread_id)}>删除</button><button type="button" onClick={() => setDeleteConfirmId(null)}>取消</button></div> : <button className="chat-history-delete" type="button" aria-label={`删除对话 ${thread.title}`} onClick={() => setDeleteConfirmId(thread.thread_id)}>×</button>}
+            </article>)}
+          </div>
+          {historyError && <p className="chat-history-error" role="alert">{historyError}</p>}
+        </>}
+      </aside>
+      {historyOpen && <button className="chat-history-backdrop" type="button" aria-label="关闭历史对话" onClick={() => setHistoryOpen(false)} />}
+      <div className={panelOpen ? 'chat-workspace with-evidence' : 'chat-workspace'} ref={workspaceRef} style={{ '--chat-left': `${splitPercent}%` } as CSSProperties}>
       <section className="chat-main-panel">
         <header className="chat-toolbar">
           <div className="chat-agent-state"><span className={configured ? 'chat-status-dot online' : 'chat-status-dot'} /><strong>{configured === null ? '正在检查 Agent' : configured ? '对话 Agent 已就绪' : '对话 Agent 未配置'}</strong></div>
           <div className="chat-toolbar-actions">
-            <button className="button button-ghost" type="button" onClick={resetConversation}>新建对话</button>
+            <button className="button button-ghost chat-history-toolbar-button" type="button" onClick={() => setHistoryOpen((value) => !value)}>{historyOpen ? '收起历史' : '历史对话'}</button>
           </div>
         </header>
         <div className="chat-messages" aria-live="polite">
@@ -578,7 +686,7 @@ export function ChatPage() {
               <div className="chat-message-bubble">
                 <small>{message.role === 'assistant' ? '智能助手' : '当前用户'}</small>
                 {message.role === 'assistant' ? <div className="chat-message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown></div> : <p>{message.content}</p>}
-                {message.generator && <em>{message.generator}</em>}
+                {message.generator && <em>{generatorLabel(message.generator)}</em>}
                 {message.role === 'assistant' && messageArtifacts.length > 0 && <div className="chat-artifact-actions" aria-label="本轮结构化产物">
                   {counts.report > 0 && <button type="button" onClick={(event) => openArtifactPanel(message, 'report', event.currentTarget)}>查看报告（{counts.report}）</button>}
                   {counts.query_result > 0 && <button type="button" onClick={(event) => openArtifactPanel(message, 'query_result', event.currentTarget)}>查看 SQL 查询（{counts.query_result}）</button>}
@@ -587,7 +695,7 @@ export function ChatPage() {
               </div>
             </article>
           })}
-          {busy && <article className="chat-message assistant pending"><span>YH</span><div><small>智能助手 · 流式生成</small><p>{streamingText || <>正在规划并查询数据<span className="typing-dots">•••</span></>}</p></div></article>}
+          {busy && <article className="chat-message assistant pending"><span>YH</span><div><small>智能助手 · 流式生成</small><p>{streamingText || '正在规划并查询数据'}<span className="typing-dots" aria-label="正在生成"><i /><i /><i /></span></p></div></article>}
           {error && <div className="chat-error" role="alert"><strong>请求失败</strong><p>{error}</p></div>}
 
           {interruptState?.kind === 'clarification' && <section className="chat-hitl-card">
@@ -690,6 +798,7 @@ export function ChatPage() {
           {artifactView === 'query_result' && queries.map((query) => <QueryResultCard query={query} key={query.query_id} />)}
         </div>
       </aside>}
+      </div>
     </div>
   )
 }
