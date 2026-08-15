@@ -64,7 +64,7 @@ npm --prefix frontend run build
 | 文件 | 用途 |
 | --- | --- |
 | `database/gas_ai_input.duckdb` | 用户、表具、检定、SCADA 和设备输入数据，只读使用 |
-| `database/gas_ai_results.duckdb` | 智能计量、智能设备诊断结果和业务工单 |
+| `database/gas_ai_results.duckdb` | 智能计量、智能设备诊断结果、智能解读缓存和业务工单 |
 | `database/user_data.db` | 用户、登录会话、对话历史、产物和 LangGraph checkpoint |
 | `safety_operations/data/security.db` | 安全事件、PPE 复核、证据、通知发件箱和处置审计 |
 | `dataset/telemetry` | 按日期分区的 SCADA Parquet 数据 |
@@ -217,6 +217,8 @@ uv run python -m safety_operations.notifier `
 - 关闭时，不自动请求 `/agent/inspect`。
 - 手动“生成智能检查结果”仍会调用 LLM。
 - 开启后，企业、日期或模块变化时对当前详情自动调用一次。
+
+计量和设备解读使用两个独立的 LangGraph `StateGraph`。后端按企业和日期读取可信诊断结果，再根据风险走不同的固定分支；LLM只负责原因排序、支持/反向证据分析、证据缺口和核查建议，不执行代码，也不能修改算法数值与状态。通过结构校验的报告按“诊断内容 + 模型 + 工作流版本 + 现场补充信息”生成指纹，复用结果保存在 `database/gas_ai_results.duckdb` 的 `inspection.workflow_report` 表中。
 
 ## LangSmith
 

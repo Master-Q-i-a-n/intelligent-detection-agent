@@ -45,7 +45,8 @@ function prepareApi(range: [string, string] | [] = ['2025-01-11', '2025-01-12'])
   })
   vi.mocked(api.overview).mockResolvedValue({
     diagnosis_date: '2025-01-12', status: 'completed', diagnosed_enterprises: 1, abnormal_enterprises: 0,
-    normal_enterprises: 1, metering_issue_count: 0, equipment_issue_count: 0, issues: [],
+    normal_enterprises: 1, metering_issue_count: 0, equipment_issue_count: 0, high_risk_count: 0,
+    risk_distribution: {}, issue_type_distribution: [], issues: [],
   })
   vi.mocked(api.meteringDiagnosis).mockImplementation(async (requestedUserId, date) => ({ ...diagnosis, user_id: requestedUserId, diagnosis_date: date }))
   vi.mocked(api.meteringHistory).mockResolvedValue({ user_id: 'u1', items: [] })
@@ -104,7 +105,9 @@ describe('Agent 自动调用控制', () => {
     await screen.findByText('存在计量偏差')
     fireEvent.click(await openAgentSettings())
     await waitFor(() => expect(api.inspectAgent).toHaveBeenCalledTimes(1))
-    fireEvent.change(screen.getByLabelText('检测日期'), { target: { value: '2025-01-11' } })
+    const dateInput = screen.getByRole('combobox', { name: '检测日期' })
+    fireEvent.change(dateInput, { target: { value: '2025-01-11' } })
+    fireEvent.keyDown(dateInput, { key: 'Enter' })
     await waitFor(() => expect(api.inspectAgent).toHaveBeenCalledTimes(2))
   })
 
@@ -114,8 +117,20 @@ describe('Agent 自动调用控制', () => {
     await screen.findByText('存在计量偏差')
     fireEvent.click(await openAgentSettings())
     await waitFor(() => expect(api.inspectAgent).toHaveBeenCalledTimes(1))
-    fireEvent.change(screen.getByLabelText('检测企业'), { target: { value: 'u2' } })
+    const enterpriseInput = screen.getByRole('combobox', { name: '检测企业' })
+    fireEvent.change(enterpriseInput, { target: { value: 'u2' } })
+    fireEvent.keyDown(enterpriseInput, { key: 'Enter' })
     await waitFor(() => expect(api.inspectAgent).toHaveBeenCalledTimes(2))
+    expect(api.meteringDiagnosis).toHaveBeenLastCalledWith('u2', '2025-01-12', expect.any(AbortSignal))
+  })
+
+  it('计量和设备详情共用可搜索企业控件', async () => {
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /智能计量详情/ }))
+    expect(screen.getByRole('combobox', { name: '检测企业' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /智能设备详情/ }))
+    expect(screen.getByRole('combobox', { name: '检测企业' })).toBeInTheDocument()
+    expect(await screen.findByText('尚无设备诊断')).toBeInTheDocument()
   })
 
   it('关闭状态手动生成仍会调用 Agent', async () => {

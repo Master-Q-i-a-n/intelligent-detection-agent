@@ -8,8 +8,10 @@ from typing import Any
 
 import duckdb
 
-from smart_metering import DataQualityAnalyzer, long_to_wide
+from smart_metering import DataQualityAnalyzer, SmartMeteringService, long_to_wide
 from anomaly_detector import AnomalyDetector
+
+DAILY_OVERVIEW_ALGORITHM_VERSION = "metering-consistency-v2-module-top5"
 
 
 class DailyDiagnosisDashboard:
@@ -20,7 +22,7 @@ class DailyDiagnosisDashboard:
         self.input_db = root / "database" / "gas_ai_input.duckdb"
         self.equipment_index = root / "agent_inputs" / "equipment_health" / "index.json"
         self.equipment_users = root / "agent_inputs" / "equipment_health" / "users"
-        self.cache_root = root / "reports" / "daily_precision_overview_v3"
+        self.cache_root = root / "reports" / "daily_precision_overview_v4"
         self.cache_root.mkdir(parents=True, exist_ok=True)
         self._cache: dict[str, dict[str, Any]] = {}
         # 同一日期只允许一个线程执行首次全量诊断，其他请求等待并复用其缓存结果。
@@ -29,30 +31,53 @@ class DailyDiagnosisDashboard:
 
     @staticmethod
     def _apply_daily_review_budget(result: dict[str, Any], max_enterprises: int = 5) -> dict[str, Any]:
-        """按风险/经济优先级只推送有限企业，其余保留在后台观察池。"""
+        """计量和设备分别选取高风险企业，并保留完整候选统计。"""
         candidates = list(result.get("issues", []))
         candidates.sort(key=lambda x: (-float(x.get("risk_score", 0)), x.get("user_id", ""), x.get("module", "")))
-        selected_ids = []
+        selected: list[dict[str, Any]] = []
+        selected_enterprise_ids: set[str] = set()
+        for module in ("metering", "equipment"):
+            module_candidates = [item for item in candidates if item.get("module") == module]
+            module_selected_ids: list[str] = []
+            for item in module_candidates:
+                user_id = str(item.get("user_id"))
+                if user_id not in module_selected_ids:
+                    module_selected_ids.append(user_id)
+                if len(module_selected_ids) >= max_enterprises:
+                    break
+            selected.extend(item for item in module_candidates if str(item.get("user_id")) in module_selected_ids)
+            selected_enterprise_ids.update(module_selected_ids)
+
+        candidate_enterprise_ids = {str(item.get("user_id")) for item in candidates}
+        risk_distribution: dict[str, int] = {"严重": 0, "高": 0, "中": 0, "较低": 0, "低": 0}
+        issue_type_counts: dict[str, int] = {}
         for item in candidates:
-            user_id = str(item.get("user_id"))
-            if user_id not in selected_ids:
-                selected_ids.append(user_id)
-            if len(selected_ids) >= max_enterprises:
-                break
-        selected = [item for item in candidates if str(item.get("user_id")) in selected_ids]
-        candidate_enterprises = len({str(item.get("user_id")) for item in candidates})
+            risk_level = str(item.get("risk_level", "未知"))
+            risk_distribution[risk_level] = risk_distribution.get(risk_level, 0) + 1
+            issue_type = str(item.get("issue_type", "未分类"))
+            issue_type_counts[issue_type] = issue_type_counts.get(issue_type, 0) + 1
+
+        metering_count = sum(item.get("module") == "metering" for item in candidates)
+        equipment_count = sum(item.get("module") == "equipment" for item in candidates)
+        high_risk_count = sum(item.get("risk_level") in ("严重", "高") for item in candidates)
         result = dict(result)
         result.update({
             "issues": selected,
-            "abnormal_enterprises": len(selected_ids),
-            "metering_issue_count": sum(item.get("module") == "metering" for item in selected),
-            "equipment_issue_count": sum(item.get("module") == "equipment" for item in selected),
-            "severe_count": sum(item.get("risk_level") in ("严重", "高") for item in selected),
-            "candidate_enterprises": candidate_enterprises,
-            "observation_enterprises": max(0, candidate_enterprises - len(selected_ids)),
+            "abnormal_enterprises": len(candidate_enterprise_ids),
+            "metering_issue_count": metering_count,
+            "equipment_issue_count": equipment_count,
+            "high_risk_count": high_risk_count,
+            "severe_count": high_risk_count,
+            "risk_distribution": risk_distribution,
+            "issue_type_distribution": [
+                {"name": name, "value": value}
+                for name, value in sorted(issue_type_counts.items(), key=lambda item: (-item[1], item[0]))
+            ],
+            "candidate_enterprises": len(candidate_enterprise_ids),
+            "observation_enterprises": max(0, len(candidate_enterprise_ids) - len(selected_enterprise_ids)),
             "suppressed_issue_count": max(0, len(candidates) - len(selected)),
-            "normal_enterprises": max(0, int(result.get("diagnosed_enterprises", 715)) - candidate_enterprises),
-            "review_budget": max_enterprises,
+            "normal_enterprises": max(0, int(result.get("diagnosed_enterprises", 715)) - len(candidate_enterprise_ids)),
+            "review_budget_per_module": max_enterprises,
         })
         return result
 
@@ -148,23 +173,20 @@ class DailyDiagnosisDashboard:
             has_hard = any("流量异常" in a or "压力异常" in a for a in alerts)
             if not has_hard:
                 continue
-            score = 0.0
-            for alert in alerts:
-                if "走气未走字" in alert: score += 80
-                elif "计数时长" in alert: score += 65
-                elif "过滤器可能阻塞" in alert: score += 60
-                elif "负压损" in alert or "高压损" in alert: score += 60
-                elif "压力传感器可能故障" in alert: score += 45
-                elif "温度异常" in alert: score += 15
-            score = round(min(100.0, score), 2)
-            volumes = [float(quality.get(f"管道{i}用气量", 0) or 0) for i in range(1, 5)]
+            # 总览复用详情的主告警权重，避免同一告警在两个页面得到不同风险等级。
+            score, risk_level = SmartMeteringService._risk(alerts, [], "无表具量程信息", 0.0, 0)
+            score = round(score, 2)
+            # 与详情页统一：按各管路标况瞬时流量合计后，以 5 分钟采样间隔积分。
+            volume_frame = group[["observed_at", "standard_instant"]].copy()
+            volume_frame["standard_instant"] = volume_frame["standard_instant"].fillna(0).clip(lower=0)
+            observed_volume = float(volume_frame.groupby("observed_at")["standard_instant"].sum().sum() * 5.0 / 60.0)
             primary = alerts[0]
             output[str(user_id)] = {
                 "user_id": str(user_id), "company_name": self._repair(str(company)), "module": "metering",
                 "issue_type": primary, "issue_tags": alerts, "risk_score": score,
-                "risk_level": "严重" if score>=80 else "高" if score>=60 else "中" if score>=35 else "较低",
-                "primary_metric": round(sum(volumes), 2), "primary_metric_name": "当日计量气量",
-                "observed_volume": round(sum(volumes), 2),
+                "risk_level": risk_level,
+                "primary_metric": round(observed_volume, 2), "primary_metric_name": "当日计量气量",
+                "observed_volume": round(observed_volume, 2),
                 "evidence_summary": "；".join(alerts[:3]),
             }
         return output
@@ -183,20 +205,16 @@ class DailyDiagnosisDashboard:
             cache_path = self.cache_root / f"{cache_key}.json"
             if cache_path.exists():
                 result = json.loads(cache_path.read_text(encoding="utf-8"))
-                self._cache[cache_key] = result
-                return result
-            previous_cache = self.root / "reports" / "daily_precision_overview_v2" / f"{cache_key}.json"
-            if previous_cache.exists():
-                result = self._apply_daily_review_budget(json.loads(previous_cache.read_text(encoding="utf-8")))
-                cache_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-                self._cache[cache_key] = result
-                return result
+                if result.get("algorithm_version") == DAILY_OVERVIEW_ALGORITHM_VERSION:
+                    self._cache[cache_key] = result
+                    return result
             metering = self._metering_rows(target)
             equipment = self._equipment_rows(str(target))
             issues = list(metering.values()) + list(equipment.values())
             issues.sort(key=lambda x: (-x["risk_score"], x["user_id"], x["module"]))
             unique = len({x["user_id"] for x in issues})
             result = {
+                "algorithm_version": DAILY_OVERVIEW_ALGORITHM_VERSION,
                 "diagnosis_date": str(target), "status": "completed", "diagnosed_enterprises": 715,
                 "abnormal_enterprises": unique, "normal_enterprises": max(0, 715-unique),
                 "metering_issue_count": len(metering), "equipment_issue_count": len(equipment),

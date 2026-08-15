@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import type { AuthUser, PageKey, UserSummary } from '../types'
 
 const navItems: Array<{ key: PageKey; label: string; english: string }> = [
@@ -129,6 +129,210 @@ export function Sidebar({
   )
 }
 
+interface SearchableOption {
+  value: string
+  label: string
+  secondary?: string
+}
+
+function SearchableCombobox({
+  options,
+  value,
+  optionName,
+  placeholder,
+  onChange,
+}: {
+  options: SearchableOption[]
+  value: string
+  optionName: string
+  placeholder: string
+  onChange: (value: string) => void
+}) {
+  const wrapperRef = useRef<HTMLDivElement | null>(null)
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  const listboxId = useId()
+  const selectedOption = useMemo(() => options.find((option) => option.value === value), [options, value])
+  const selectedLabel = selectedOption
+    ? [selectedOption.label, selectedOption.secondary].filter(Boolean).join(' · ')
+    : ''
+  const [query, setQuery] = useState(selectedLabel)
+  const [open, setOpen] = useState(false)
+  const [activeIndex, setActiveIndex] = useState(-1)
+  const normalizedQuery = query.trim().toLocaleLowerCase()
+  const filteredOptions = useMemo(() => options.filter((option) => {
+    if (!normalizedQuery) return true
+    return `${option.label} ${option.secondary || ''}`.toLocaleLowerCase().includes(normalizedQuery)
+  }), [normalizedQuery, options])
+
+  useEffect(() => {
+    setQuery(selectedLabel)
+  }, [selectedLabel])
+
+  useEffect(() => {
+    if (!open) return
+    const closeOnOutside = (event: PointerEvent) => {
+      if (!wrapperRef.current?.contains(event.target as Node)) {
+        setOpen(false)
+        setActiveIndex(-1)
+        setQuery(selectedLabel)
+      }
+    }
+    document.addEventListener('pointerdown', closeOnOutside)
+    return () => document.removeEventListener('pointerdown', closeOnOutside)
+  }, [open, selectedLabel])
+
+  function selectOption(option: SearchableOption) {
+    setQuery([option.label, option.secondary].filter(Boolean).join(' · '))
+    setOpen(false)
+    setActiveIndex(-1)
+    if (option.value !== value) onChange(option.value)
+  }
+
+  function openAllOptions() {
+    setQuery('')
+    setOpen(true)
+    const selectedIndex = options.findIndex((option) => option.value === value)
+    setActiveIndex(selectedIndex >= 0 ? selectedIndex : (options.length ? 0 : -1))
+  }
+
+  function handleKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      if (!open) {
+        openAllOptions()
+        return
+      }
+      if (!filteredOptions.length) return
+      const offset = event.key === 'ArrowDown' ? 1 : -1
+      setActiveIndex((current) => {
+        const start = current >= 0 ? current : (offset > 0 ? -1 : 0)
+        return (start + offset + filteredOptions.length) % filteredOptions.length
+      })
+      return
+    }
+    if (event.key === 'Enter' && open && activeIndex >= 0 && filteredOptions[activeIndex]) {
+      event.preventDefault()
+      selectOption(filteredOptions[activeIndex])
+      return
+    }
+    if (event.key === 'Escape' && open) {
+      event.preventDefault()
+      setOpen(false)
+      setActiveIndex(-1)
+      setQuery(selectedLabel)
+    }
+  }
+
+  return (
+    <div
+      className="filter-combobox"
+      ref={wrapperRef}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+          setOpen(false)
+          setActiveIndex(-1)
+          setQuery(selectedLabel)
+        }
+      }}
+    >
+      <input
+        ref={inputRef}
+        type="text"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-controls={listboxId}
+        aria-expanded={open}
+        aria-activedescendant={open && activeIndex >= 0 ? `${listboxId}-option-${activeIndex}` : undefined}
+        value={query}
+        placeholder={options.length ? placeholder : `无可用${optionName}`}
+        disabled={!options.length}
+        autoComplete="off"
+        onFocus={(event) => {
+          setOpen(true)
+          setActiveIndex(filteredOptions.length ? 0 : -1)
+          // 聚焦后选中当前展示值，用户可直接输入关键词替换。
+          event.currentTarget.select()
+        }}
+        onChange={(event) => {
+          setQuery(event.target.value)
+          setOpen(true)
+          setActiveIndex(options.length ? 0 : -1)
+        }}
+        onKeyDown={handleKeyDown}
+      />
+      <button
+        className="filter-combobox-toggle"
+        type="button"
+        aria-label={open ? `关闭${optionName}列表` : `展开${optionName}列表`}
+        aria-expanded={open}
+        disabled={!options.length}
+        onClick={() => {
+          if (open) {
+            setOpen(false)
+            setActiveIndex(-1)
+            setQuery(selectedLabel)
+          } else {
+            inputRef.current?.focus()
+            // 先取得输入焦点，再展开完整列表，避免焦点事件覆盖当前高亮项。
+            openAllOptions()
+          }
+        }}
+      >
+        <span aria-hidden="true" />
+      </button>
+      {open && (
+        <div className="filter-options" id={listboxId} role="listbox" aria-label={`${optionName}候选列表`}>
+          {filteredOptions.length ? filteredOptions.map((option, index) => (
+            <button
+              id={`${listboxId}-option-${index}`}
+              type="button"
+              role="option"
+              tabIndex={-1}
+              aria-selected={option.value === value}
+              className={index === activeIndex ? 'active' : ''}
+              key={option.value}
+              onMouseEnter={() => setActiveIndex(index)}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => selectOption(option)}
+            >
+              <strong>{option.label}</strong>
+              {option.secondary && <small>{option.secondary}</small>}
+            </button>
+          )) : <div className="filter-options-empty" role="status">没有匹配的{optionName}</div>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export function EnterpriseCombobox({ users, userId, onUserChange }: {
+  users: UserSummary[]
+  userId: string
+  onUserChange: (userId: string) => void
+}) {
+  return <SearchableCombobox
+    options={users.map((user) => ({ value: user.user_id, label: user.company_name, secondary: user.user_id }))}
+    value={userId}
+    optionName="企业"
+    placeholder="输入企业名称或编号"
+    onChange={onUserChange}
+  />
+}
+
+export function DateCombobox({ dates, date, onDateChange }: {
+  dates: string[]
+  date: string
+  onDateChange: (date: string) => void
+}) {
+  return <SearchableCombobox
+    options={dates.map((item) => ({ value: item, label: item }))}
+    value={date}
+    optionName="日期"
+    placeholder="输入检测日期"
+    onChange={onDateChange}
+  />
+}
+
 export function Topbar({
   page,
   users,
@@ -167,21 +371,12 @@ export function Topbar({
         {page !== 'overview' && page !== 'safety' && page !== 'chat' && (
           <label>
             <span>检测企业</span>
-            <select value={userId} onChange={(event) => onUserChange(event.target.value)} disabled={!users.length}>
-              {users.map((user) => (
-                <option value={user.user_id} key={user.user_id}>
-                  {user.company_name} · {user.user_id}
-                </option>
-              ))}
-            </select>
+            <EnterpriseCombobox users={users} userId={userId} onUserChange={onUserChange} />
           </label>
         )}
         {page !== 'safety' && page !== 'chat' && <label>
           <span>检测日期</span>
-          <select value={date} onChange={(event) => onDateChange(event.target.value)} disabled={!dates.length}>
-            {!dates.length && <option value="">无可用日期</option>}
-            {dates.map((item) => <option value={item} key={item}>{item}</option>)}
-          </select>
+          <DateCombobox dates={dates} date={date} onDateChange={onDateChange} />
         </label>}
         {page !== 'chat' && (
           <button className="button button-primary" type="button" disabled={busy || (page !== 'safety' && !date)} onClick={onRefresh}>

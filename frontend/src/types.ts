@@ -27,17 +27,19 @@ export interface DailyIssue {
   primary_metric: number | null
 }
 
-export interface DailyOverview {
+  export interface DailyOverview {
   diagnosis_date: string
   status: string
   diagnosed_enterprises: number
   abnormal_enterprises: number
   normal_enterprises: number
-  metering_issue_count: number
-  equipment_issue_count: number
-  high_risk_count?: number
-  issues: DailyIssue[]
-}
+    metering_issue_count: number
+    equipment_issue_count: number
+    high_risk_count: number
+    risk_distribution: Record<string, number>
+    issue_type_distribution: Array<{ name: string; value: number }>
+    issues: DailyIssue[]
+  }
 
 export interface MeteringHistoryItem {
   date: string
@@ -164,13 +166,33 @@ export interface EquipmentWaveform {
   z: number[]
 }
 
+export interface AgentEvidenceItem {
+  evidence_id: string
+  category: string
+  statement: string
+  source: string
+  value?: unknown
+  unit?: string | null
+}
+
+export interface AgentCauseAssessment {
+  rank: number
+  cause: string
+  confidence: number
+  supporting_evidence_ids: string[]
+  counter_evidence_ids: string[]
+}
+
 export interface AgentReport {
+  report_id?: string
   generator?: string
   title?: string
   inspection_conclusion?: string
   conclusion?: string
   summary?: string
   risk_level?: string
+  risk_score?: number | null
+  decision?: string
   evidence_chain?: Array<string | Record<string, unknown>>
   evidence?: Array<string | Record<string, unknown>>
   field_checklist?: string[]
@@ -178,6 +200,16 @@ export interface AgentReport {
   recommendations?: string[]
   work_order_advice?: string
   work_order_suggestion?: string
+  workflow_route?: string
+  workflow_version?: string
+  cache_hit?: boolean
+  analysis_confidence?: number
+  possible_causes?: AgentCauseAssessment[]
+  evidence_items?: AgentEvidenceItem[]
+  counter_evidence?: string[]
+  missing_evidence?: string[]
+  data_boundary?: string
+  llm_notice?: string
   [key: string]: unknown
 }
 
@@ -186,7 +218,6 @@ export interface AgentInspectionPayload {
   user_id: string
   diagnosis_date: string
   field_text: string
-  context: Record<string, unknown>
 }
 
 export type SecurityDecision = 'CONFIRMED' | 'UNCERTAIN'

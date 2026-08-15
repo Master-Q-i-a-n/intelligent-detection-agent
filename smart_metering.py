@@ -418,9 +418,8 @@ class SmartMeteringService:
         }
 
     @staticmethod
-    def _risk(alerts: List[str], intervals: List[IntervalResult], spec_result: str, makeup: float, quality_status: int):
-        # 精准稽查策略：闫赛联合诊断结果是主证据；预测基线、量程和补量仅作辅助，
-        # 避免企业停产/减产被误判并形成大量低价值工单。
+    def primary_risk_score(alerts: List[str]) -> Tuple[List[str], float]:
+        """统一计算总览和详情共用的联合诊断主告警分数。"""
         primary_alerts = [a for a in alerts if "不做诊断" not in a and "不可用" not in a]
         score = 0.0
         if any("走气未走字" in a for a in primary_alerts):
@@ -435,6 +434,13 @@ class SmartMeteringService:
             score += 40
         if any("温度异常" in a for a in primary_alerts):
             score += 30
+        return primary_alerts, score
+
+    @staticmethod
+    def _risk(alerts: List[str], intervals: List[IntervalResult], spec_result: str, makeup: float, quality_status: int):
+        # 精准稽查策略：闫赛联合诊断结果是主证据；预测基线、量程和补量仅作辅助，
+        # 避免企业停产/减产被误判并形成大量低价值工单。
+        primary_alerts, score = SmartMeteringService.primary_risk_score(alerts)
         if primary_alerts:
             if intervals:
                 score += min(10, len(intervals) * 2)

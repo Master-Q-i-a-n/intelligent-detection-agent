@@ -29,7 +29,7 @@ export function AutoAgentPanel({ enabled, record }: { enabled: boolean; record?:
         </div>
       )}
       {enabled && (!record || record.status === 'idle') && <div className="agent-off-state"><span className="agent-lock">A</span><div><strong>等待诊断数据</strong><p>数据就绪后将自动发起一次解读。</p></div></div>}
-      {enabled && record?.status === 'loading' && <div className="agent-loading"><span className="scanner" /><div><strong>Agent 正在建立证据链</strong><small>当前调用键已锁定，不会重复请求</small></div></div>}
+      {enabled && record?.status === 'loading' && <div className="agent-loading"><span className="scanner" /><div><strong>Agent 正在筛选诊断证据</strong><small>工作流会按风险路径分析，当前指纹不会重复请求</small></div></div>}
       {enabled && record?.status === 'error' && <div className="inline-error" role="alert">Agent 自动解读失败：{record.error}</div>}
       {enabled && record?.status === 'success' && record.report && <AgentReportView report={record.report} />}
     </Panel>
@@ -40,12 +40,10 @@ export function ManualAgentPanel({
   module,
   userId,
   date,
-  context,
 }: {
   module: BusinessModule
   userId: string
   date: string
-  context: Record<string, unknown> | null
 }) {
   const [fieldText, setFieldText] = useState('')
   const [loading, setLoading] = useState(false)
@@ -58,14 +56,14 @@ export function ManualAgentPanel({
   }, [module, userId, date])
 
   async function generate() {
-    if (!context || !userId || !date) {
-      setError('请先加载完整的企业诊断数据。')
+    if (!userId || !date) {
+      setError('请先选择企业和有效日期。')
       return
     }
     setLoading(true)
     setError('')
     try {
-      const result = await api.inspectAgent({ module, user_id: userId, diagnosis_date: date, field_text: fieldText, context })
+      const result = await api.inspectAgent({ module, user_id: userId, diagnosis_date: date, field_text: fieldText })
       setReport(result)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '未知错误')
@@ -87,7 +85,7 @@ export function ManualAgentPanel({
       </label>
       <div className="manual-agent-actions">
         <p><b>注意：</b>点击后会调用 LLM；接口不可用时由后端返回本地规则回退报告。</p>
-        <button className="button button-primary" type="button" disabled={loading || !context} onClick={generate}>
+        <button className="button button-primary" type="button" disabled={loading || !userId || !date} onClick={generate}>
           {loading ? '智能检查生成中…' : '生成智能检查结果'}
         </button>
       </div>

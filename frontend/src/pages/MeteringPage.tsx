@@ -70,7 +70,6 @@ export function MeteringPage(props: MeteringPageProps) {
         user_id: userId,
         diagnosis_date: date,
         field_text: '',
-        context: diagnosis as unknown as Record<string, unknown>,
       },
     })
   }, [active, agentKey, autoAgentEnabled, date, diagnosis, onAutoRequest, userId])
@@ -160,7 +159,7 @@ export function MeteringPage(props: MeteringPageProps) {
         </DataTable>
       </Panel>
 
-      <ManualAgentPanel module="metering" userId={userId} date={date} context={diagnosis as unknown as Record<string, unknown>} />
+      <ManualAgentPanel module="metering" userId={userId} date={date} />
     </div>
   )
 }

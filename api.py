@@ -84,17 +84,27 @@ user_store = UserStore(USER_DB)
 app.include_router(create_conversation_router(ROOT, user_store))
 service = SmartMeteringService(use_deep_model=True)
 fast_service = SmartMeteringService(use_deep_model=False)
-inspection_agent = InspectionAgent(ROOT)
 daily_dashboard_service = DailyDiagnosisDashboard(ROOT)
 diagnosis_lock = threading.RLock()
 diagnosis_cache: Dict[str, Dict[str, Any]] = {}
-DETAIL_CACHE_ROOT = ROOT / "reports" / "metering_detail_cache_v2"
+METERING_DETAIL_ALGORITHM_VERSION = "metering-consistency-v1"
+DETAIL_CACHE_ROOT = ROOT / "reports" / "metering_detail_cache_v3"
 DETAIL_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 def _detail_cache_path(user_id: str, diagnosis_date: date) -> Path:
     safe_user = str(user_id).replace("/", "").replace("\\", "")
     return DETAIL_CACHE_ROOT / str(diagnosis_date) / f"{safe_user}.json"
+
+
+def _is_current_metering_detail(result: Dict[str, Any]) -> bool:
+    return result.get("algorithm_version") == METERING_DETAIL_ALGORITHM_VERSION
+
+
+def _stamp_metering_detail(result: Dict[str, Any]) -> Dict[str, Any]:
+    stamped = dict(result)
+    stamped["algorithm_version"] = METERING_DETAIL_ALGORITHM_VERSION
+    return stamped
 
 
 def _repair_text(value: Any) -> Any:
@@ -127,11 +137,12 @@ class BatchDiagnosisRequest(BaseModel):
 
 
 class InspectionRequest(BaseModel):
-    module: str
+    module: Literal["metering", "equipment"]
     user_id: str
     diagnosis_date: date
     field_text: str = ""
-    context: Dict[str, Any]
+    # 兼容旧版前端；工作流始终从后端重新读取可信诊断结果。
+    context: Optional[Dict[str, Any]] = None
 
 
 class SecurityNotification(BaseModel):
@@ -334,6 +345,39 @@ def _equipment_for_date(payload: dict[str, Any], diagnosis_date: date) -> dict[s
     }
 
 
+def _inspection_metering_context(user_id: str, diagnosis_date: date) -> dict[str, Any]:
+    """优先复用后端诊断缓存；独立调用 Agent 时也能自行完成可信取数。"""
+
+    cache_key = f"{user_id}:{diagnosis_date}"
+    if cache_key in diagnosis_cache and _is_current_metering_detail(diagnosis_cache[cache_key]):
+        return diagnosis_cache[cache_key]
+    disk_cache = _detail_cache_path(user_id, diagnosis_date)
+    if disk_cache.exists():
+        cached = _load_json(disk_cache)
+        if _is_current_metering_detail(cached):
+            diagnosis_cache[cache_key] = cached
+            return cached
+    with diagnosis_lock:
+        if cache_key in diagnosis_cache and _is_current_metering_detail(diagnosis_cache[cache_key]):
+            return diagnosis_cache[cache_key]
+        result = _stamp_metering_detail(_json_safe(fast_service.diagnose(user_id, diagnosis_date, save=False)))
+        diagnosis_cache[cache_key] = result
+        disk_cache.parent.mkdir(parents=True, exist_ok=True)
+        disk_cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result
+
+
+def _inspection_equipment_context(user_id: str, diagnosis_date: date) -> dict[str, Any]:
+    return _equipment_for_date(_equipment_user(user_id), diagnosis_date)
+
+
+inspection_agent = InspectionAgent(
+    ROOT,
+    metering_loader=_inspection_metering_context,
+    equipment_loader=_inspection_equipment_context,
+)
+
+
 @app.get("/health")
 def health():
     return {
@@ -443,18 +487,19 @@ def diagnose(request: DiagnosisRequest):
     disk_cache = _detail_cache_path(request.user_id, request.diagnosis_date)
     try:
         # 详情页反复打开时直接复用同一进程内的诊断结果，避免重复加载模型和查询30天数据。
-        if not request.save and cache_key in diagnosis_cache:
+        if not request.save and cache_key in diagnosis_cache and _is_current_metering_detail(diagnosis_cache[cache_key]):
             return diagnosis_cache[cache_key]
         if not request.save and disk_cache.exists():
             cached = _load_json(disk_cache)
-            diagnosis_cache[cache_key] = cached
-            return cached
+            if _is_current_metering_detail(cached):
+                diagnosis_cache[cache_key] = cached
+                return cached
         # DuckDB为单文件数据库，同一日期重复删除/插入必须串行执行。
         with diagnosis_lock:
-            if not request.save and cache_key in diagnosis_cache:
+            if not request.save and cache_key in diagnosis_cache and _is_current_metering_detail(diagnosis_cache[cache_key]):
                 return diagnosis_cache[cache_key]
             diagnosis_service = service if request.deep_model else fast_service
-            result = _json_safe(diagnosis_service.diagnose(request.user_id, request.diagnosis_date, request.save))
+            result = _stamp_metering_detail(_json_safe(diagnosis_service.diagnose(request.user_id, request.diagnosis_date, request.save)))
             diagnosis_cache[cache_key] = result
             disk_cache.parent.mkdir(parents=True, exist_ok=True)
             disk_cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -471,7 +516,7 @@ def diagnose_batch(request: BatchDiagnosisRequest):
     for user_id in request.user_ids:
         try:
             with diagnosis_lock:
-                result = _json_safe(service.diagnose(user_id, request.diagnosis_date, request.save))
+                result = _stamp_metering_detail(_json_safe(service.diagnose(user_id, request.diagnosis_date, request.save)))
                 diagnosis_cache[f"{user_id}:{request.diagnosis_date}"] = result
                 outputs.append(result)
         except Exception as exc:
@@ -531,8 +576,9 @@ def inspect(request: InspectionRequest):
             user_id=request.user_id,
             diagnosis_date=str(request.diagnosis_date),
             field_text=request.field_text,
-            context=request.context,
         )
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

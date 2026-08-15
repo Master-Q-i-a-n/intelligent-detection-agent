@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
 import { Chart, buildHorizontalBarOption } from '../components/Charts'
 import { DataTable, EmptyState, ErrorState, KpiGrid, LoadingState, Panel, formatNumber } from '../components/Common'
-import type { DailyIssue, DailyOverview, PageKey } from '../types'
+import type { BusinessModule, DailyIssue, DailyOverview, PageKey } from '../types'
 
 const riskColors: Record<string, string> = {
   严重: '#ff5263',
@@ -25,7 +25,7 @@ export function OverviewPage({ active, date, refreshToken, onBusyChange, onOpenI
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [search, setSearch] = useState('')
-  const [moduleFilter, setModuleFilter] = useState('all')
+  const [moduleFilter, setModuleFilter] = useState<BusinessModule>('metering')
   const [riskFilter, setRiskFilter] = useState('all')
 
   useEffect(() => {
@@ -57,24 +57,20 @@ export function OverviewPage({ active, date, refreshToken, onBusyChange, onOpenI
   }, [active, date, refreshToken, onBusyChange])
 
   const riskDistribution = useMemo(() => {
-    const counts: Record<string, number> = { 严重: 0, 高: 0, 中: 0, 较低: 0 }
-    data?.issues.forEach((issue) => { counts[issue.risk_level] = (counts[issue.risk_level] || 0) + 1 })
-    return Object.entries(counts).map(([name, value]) => ({ name, value, color: riskColors[name] }))
+    const levels = ['严重', '高', '中', '较低', '低']
+    return levels.map((name) => ({ name, value: data?.risk_distribution[name] || 0, color: riskColors[name] }))
   }, [data])
 
   const issueTypes = useMemo(() => {
-    const counts = new Map<string, number>()
-    data?.issues.forEach((issue) => counts.set(issue.issue_type, (counts.get(issue.issue_type) || 0) + 1))
-    return [...counts.entries()]
-      .sort((a, b) => b[1] - a[1])
+    return (data?.issue_type_distribution || [])
       .slice(0, 6)
-      .map(([name, value]) => ({ name, value, color: '#21d4d0' }))
+      .map(({ name, value }) => ({ name, value, color: '#21d4d0' }))
   }, [data])
 
   const filteredIssues = useMemo(() => {
     const query = search.trim().toLowerCase()
     return (data?.issues || []).filter((issue) => {
-      const matchesModule = moduleFilter === 'all' || issue.module === moduleFilter
+      const matchesModule = issue.module === moduleFilter
       const matchesRisk = riskFilter === 'all' || issue.risk_level === riskFilter
       const content = `${issue.company_name} ${issue.user_id} ${issue.issue_tags.join(' ')} ${issue.issue_type}`.toLowerCase()
       return matchesModule && matchesRisk && (!query || content.includes(query))
@@ -89,7 +85,7 @@ export function OverviewPage({ active, date, refreshToken, onBusyChange, onOpenI
     { name: '智能计量', value: data.metering_issue_count, color: '#3f91ff' },
     { name: '智能设备', value: data.equipment_issue_count, color: '#f2ad35' },
   ]
-  const highRisk = data.issues.filter((issue) => ['严重', '高'].includes(issue.risk_level)).length
+  const highRisk = data.high_risk_count
 
   return (
     <div className="page-stack">
@@ -130,8 +126,8 @@ export function OverviewPage({ active, date, refreshToken, onBusyChange, onOpenI
             placeholder="搜索企业 / 编号 / 问题"
             aria-label="搜索异常企业"
           />
-          <select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)} aria-label="按模块筛选">
-            <option value="all">全部模块</option><option value="metering">智能计量</option><option value="equipment">智能设备</option>
+          <select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value as BusinessModule)} aria-label="按模块筛选">
+            <option value="metering">智能计量</option><option value="equipment">智能设备</option>
           </select>
           <select value={riskFilter} onChange={(event) => setRiskFilter(event.target.value)} aria-label="按风险筛选">
             <option value="all">全部风险</option><option value="严重">严重</option><option value="高">高</option><option value="中">中</option><option value="较低">较低</option><option value="低">低</option>
@@ -142,7 +138,7 @@ export function OverviewPage({ active, date, refreshToken, onBusyChange, onOpenI
           <tbody>
             {filteredIssues.length ? filteredIssues.map((issue) => (
               <IssueRow key={`${issue.module}-${issue.user_id}-${issue.issue_type}`} issue={issue} onOpenIssue={onOpenIssue} />
-            )) : <tr><td colSpan={7}><div className="table-empty">没有符合筛选条件的问题企业</div></td></tr>}
+            )) : <tr><td colSpan={7}><div className="table-empty">没有符合筛选条件的{moduleFilter === 'metering' ? '计量' : '设备'}问题企业</div></td></tr>}
           </tbody>
         </DataTable>
       </Panel>

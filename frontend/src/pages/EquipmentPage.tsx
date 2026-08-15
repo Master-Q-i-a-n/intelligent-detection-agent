@@ -69,7 +69,6 @@ export function EquipmentPage(props: EquipmentPageProps) {
       key: agentKey,
       payload: {
         module: 'equipment', user_id: userId, diagnosis_date: date, field_text: '',
-        context: dashboard as unknown as Record<string, unknown>,
       },
     })
   }, [active, agentKey, autoAgentEnabled, dashboard, date, onAutoRequest, userId])
@@ -155,7 +154,7 @@ export function EquipmentPage(props: EquipmentPageProps) {
         </DataTable>
       </Panel>
 
-      <ManualAgentPanel module="equipment" userId={userId} date={date} context={dashboard as unknown as Record<string, unknown>} />
+      <ManualAgentPanel module="equipment" userId={userId} date={date} />
     </div>
   )
 }

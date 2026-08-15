@@ -1,6 +1,7 @@
 CREATE SCHEMA IF NOT EXISTS metering;
 CREATE SCHEMA IF NOT EXISTS equipment;
 CREATE SCHEMA IF NOT EXISTS operations;
+CREATE SCHEMA IF NOT EXISTS inspection;
 
 CREATE TABLE IF NOT EXISTS metering.diagnosis_run (
     run_id VARCHAR PRIMARY KEY,
@@ -111,4 +112,18 @@ CREATE TABLE IF NOT EXISTS operations.work_order_audit (
     operator VARCHAR NOT NULL,
     details_json VARCHAR NOT NULL,
     acted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 智能解读只缓存通过结构校验的 LLM 报告；算法输入变化后会产生新的指纹。
+CREATE TABLE IF NOT EXISTS inspection.workflow_report (
+    report_id VARCHAR PRIMARY KEY,
+    input_fingerprint VARCHAR UNIQUE NOT NULL,
+    module VARCHAR NOT NULL,
+    user_id VARCHAR NOT NULL,
+    diagnosis_date DATE NOT NULL,
+    workflow_route VARCHAR NOT NULL,
+    workflow_version VARCHAR NOT NULL,
+    model_name VARCHAR NOT NULL,
+    report_json VARCHAR NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
