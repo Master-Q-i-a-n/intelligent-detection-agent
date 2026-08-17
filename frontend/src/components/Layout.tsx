@@ -121,7 +121,6 @@ export function Sidebar({
               <div><strong>Agent 自动解读</strong><p>开启后，企业、日期或模块变化时自动调用一次 LLM。</p></div>
               <button className="settings-switch" type="button" role="switch" aria-checked={autoAgentEnabled} aria-label="Agent 自动解读" onClick={() => onAutoAgentChange(!autoAgentEnabled)}><span /></button>
             </div>
-            <p className="settings-note"><span className={autoAgentEnabled ? 'enabled' : ''} />当前状态：{autoAgentEnabled ? '已开启' : '已关闭'}。刷新页面后默认恢复关闭。</p>
           </div>
         </section>
       </div>}

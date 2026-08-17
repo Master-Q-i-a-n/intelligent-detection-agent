@@ -66,6 +66,7 @@ async function openAgentSettings() {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  window.localStorage.clear()
   prepareApi()
 })
 
@@ -74,16 +75,20 @@ afterEach(() => {
 })
 
 describe('Agent 自动调用控制', () => {
-  it('初始挂载和重新挂载时开关都关闭', async () => {
-    // 本用例只验证组件会话状态，使用空日期避免业务总览请求干扰重新挂载。
+  it('首次默认关闭，并在重新挂载后恢复用户选择', async () => {
+    // 使用空日期避免业务总览请求干扰持久化状态验证。
     prepareApi([])
     const first = render(<App />)
     const firstSwitch = await openAgentSettings()
     expect(firstSwitch).toHaveAttribute('aria-checked', 'false')
+    fireEvent.click(firstSwitch)
+    expect(firstSwitch).toHaveAttribute('aria-checked', 'true')
+    expect(window.localStorage.getItem('yaoheng:auto-agent-enabled')).toBe('true')
     first.unmount()
+
     prepareApi([])
     render(<App />)
-    expect(await openAgentSettings()).toHaveAttribute('aria-checked', 'false')
+    expect(await openAgentSettings()).toHaveAttribute('aria-checked', 'true')
   })
 
   it('关闭状态进入计量详情不会调用 Agent，开启后当前键仅调用一次', async () => {

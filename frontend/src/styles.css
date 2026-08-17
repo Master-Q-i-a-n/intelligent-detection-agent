@@ -87,9 +87,6 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .settings-switch span { display: block; width: 18px; height: 18px; border-radius: 50%; background: #748895; transition: transform .2s ease, background .2s ease; }
 .settings-switch[aria-checked="true"] { border-color: var(--cyan); background: #12373e; }
 .settings-switch[aria-checked="true"] span { transform: translateX(20px); background: var(--cyan); box-shadow: 0 0 11px #21d4d0aa; }
-.settings-note { display: flex; align-items: center; gap: 9px; margin: 14px 2px 0; color: #5f8192; font-size: 11px; }
-.settings-note > span { width: 8px; height: 8px; border-radius: 50%; background: #607681; }
-.settings-note > span.enabled { background: var(--cyan); box-shadow: 0 0 10px var(--cyan); }
 
 /* 登录页延续工业控制台语言，并以明确的身份门禁区分未登录状态。 */
 .auth-shell { min-width: 0; min-height: 100vh; display: grid; place-items: center; padding: clamp(24px, 7vw, 100px); background: radial-gradient(circle at 65% 25%, #103345 0, transparent 32%), repeating-linear-gradient(90deg, transparent 0 79px, #17313c22 80px), #06131c; }

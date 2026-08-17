@@ -11,6 +11,8 @@ import { ChatPage } from './pages/ChatPage'
 import { AuthPage } from './pages/AuthPage'
 import type { AuthUser, PageKey, SecurityEvent, SecurityOverview, UserSummary } from './types'
 
+const AUTO_AGENT_STORAGE_KEY = 'yaoheng:auto-agent-enabled'
+
 function datesBetween(range: [string, string] | [] | undefined): string[] {
   if (!range || range.length !== 2 || !range[0] || !range[1]) return []
   const start = new Date(`${range[0]}T00:00:00Z`)
@@ -35,8 +37,14 @@ export default function App() {
   const [initialError, setInitialError] = useState('')
   const [refreshToken, setRefreshToken] = useState(0)
   const [busy, setBusy] = useState(false)
-  // 每次页面加载固定为 false，不读取或写入 localStorage。
-  const [autoAgentEnabled, setAutoAgentEnabled] = useState(false)
+  const [autoAgentEnabled, setAutoAgentEnabled] = useState(() => {
+    // 首次使用默认关闭；用户选择写入本地设置，刷新页面时恢复。
+    try {
+      return window.localStorage.getItem(AUTO_AGENT_STORAGE_KEY) === 'true'
+    } catch {
+      return false
+    }
+  })
   const [agentRecords, setAgentRecords] = useState<Record<string, AgentRecord>>({})
   const [securityOverviewState, setSecurityOverviewState] = useState<SecurityOverview | null>(null)
   const [securityToast, setSecurityToast] = useState<SecurityEvent | null>(null)
@@ -90,6 +98,11 @@ export default function App() {
 
   const changeAutoAgent = useCallback((enabled: boolean) => {
     setAutoAgentEnabled(enabled)
+    try {
+      window.localStorage.setItem(AUTO_AGENT_STORAGE_KEY, String(enabled))
+    } catch {
+      // 浏览器禁用本地存储时仍保留本次页面会话内的设置。
+    }
     if (!enabled) {
       // 取消浏览器等待并依赖请求控制器忽略迟到响应；服务端正在执行的 LLM 无法保证撤回。
       agentControllers.current.forEach((controller) => controller.abort())
@@ -196,7 +209,6 @@ export default function App() {
       await api.logout()
     } finally {
       setCurrentUser(null)
-      setAutoAgentEnabled(false)
       setAgentRecords({})
       setUsers([])
       setPage('overview')
