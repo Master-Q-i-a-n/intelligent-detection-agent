@@ -71,7 +71,7 @@ class GasDataRepository:
         with self.connect() as con:
             return con.execute(
                 """
-                SELECT observed_at, pipeline_no, pressure, temperature,
+                SELECT observed_at, entity_name, source_file, pipeline_no, pressure, temperature,
                        operational_instant, operational_cumulative,
                        standard_instant, standard_cumulative
                 FROM telemetry.scada_observation
@@ -86,7 +86,8 @@ class GasDataRepository:
         with self.connect() as con:
             return con.execute(
                 """
-                SELECT observed_at, data_date, pipeline_no, standard_instant, standard_cumulative
+                SELECT observed_at, data_date, entity_name, source_file,
+                       pipeline_no, standard_instant, standard_cumulative
                 FROM telemetry.scada_observation
                 WHERE user_id=? AND data_date>=? AND data_date<?
                 ORDER BY observed_at, pipeline_no
@@ -235,12 +236,14 @@ class SmartMeteringService:
                 (p1, s1), (p2, s2) = used
                 mask = (s1 > 0) & (s2 > 0)
                 high, low = np.maximum(s1[mask], s2[mask]), np.minimum(s1[mask], s2[mask])
-                violation_ratio = float(((high - low) > low).mean()) if mask.any() else 0.0
+                ratio_threshold = float(detector.flow_imbalance_params.get("ratio_threshold", 0.2))
+                relative_gap = (high - low) / np.maximum(high, 1e-6)
+                violation_ratio = float((relative_gap > ratio_threshold).mean()) if mask.any() else 0.0
                 evidence["flow"].append({
                     "pipelines": [p1, p2],
                     "simultaneous_use_points": int(mask.sum()),
                     "imbalance_ratio": round(violation_ratio, 4),
-                    "ratio_threshold": float(detector.flow_imbalance_params.get("ratio_threshold", 0.2)),
+                    "ratio_threshold": ratio_threshold,
                     "pipeline_daily_volume": [
                         round(float(quality.get(f"管道{p1}用气量", 0) or 0), 4),
                         round(float(quality.get(f"管道{p2}用气量", 0) or 0), 4),
@@ -282,12 +285,29 @@ class SmartMeteringService:
         if day_long.empty:
             return pd.Series(dtype=float)
         df = day_long.copy()
+        df["observed_at"] = pd.to_datetime(df["observed_at"], errors="coerce")
         df["standard_instant"] = pd.to_numeric(df["standard_instant"], errors="coerce").clip(lower=0)
-        total = df.groupby("observed_at")["standard_instant"].sum(min_count=1).sort_index()
-        total.index = pd.DatetimeIndex(total.index)
-        start = total.index.min().normalize()
+        df = df.dropna(subset=["observed_at"])
+        if df.empty:
+            return pd.Series(dtype=float)
+        # 同一用户可能包含多个厂区；每个厂区先独立重采样，再汇总为企业流量，
+        # 避免不同采样频率的原始行被直接相加或同名管路互相覆盖。
+        if "entity_name" in df.columns:
+            site_key = df["entity_name"].fillna("").astype(str)
+        elif "source_file" in df.columns:
+            site_key = df["source_file"].fillna("").astype(str)
+        else:
+            site_key = pd.Series("__default__", index=df.index)
+        df["_site_key"] = site_key.where(site_key.str.len() > 0, "__default__")
+        site_flows = []
+        for _, site in df.groupby("_site_key", sort=False):
+            total = site.groupby("observed_at")["standard_instant"].sum(min_count=1).sort_index()
+            total.index = pd.DatetimeIndex(total.index)
+            site_flows.append(total.resample("5min").mean())
+        total = pd.concat(site_flows, axis=1).sum(axis=1, min_count=1).sort_index()
+        start = pd.DatetimeIndex(total.index).min().normalize()
         full_index = pd.date_range(start, start + timedelta(days=1) - timedelta(minutes=5), freq="5min")
-        return total.resample("5min").mean().reindex(full_index)
+        return total.reindex(full_index)
 
     @staticmethod
     def _history_baseline(history: pd.DataFrame, target_index: pd.DatetimeIndex) -> Tuple[pd.Series, pd.Series, int]:
@@ -297,8 +317,24 @@ class SmartMeteringService:
         hist["standard_instant"] = pd.to_numeric(hist["standard_instant"], errors="coerce").clip(lower=0)
         hist["observed_at"] = pd.to_datetime(hist["observed_at"], errors="coerce")
         hist = hist.dropna(subset=["observed_at"])
-        total = hist.groupby("observed_at")["standard_instant"].sum(min_count=1).sort_index()
-        total = total.resample("5min").mean()
+        if "entity_name" in hist.columns:
+            site_key = hist["entity_name"].fillna("").astype(str)
+        elif "source_file" in hist.columns:
+            site_key = hist["source_file"].fillna("").astype(str)
+        else:
+            site_key = pd.Series("__default__", index=hist.index)
+        hist["_site_key"] = site_key.where(site_key.str.len() > 0, "__default__")
+        site_flows = []
+        for _, site in hist.groupby("_site_key", sort=False):
+            flow = site.groupby("observed_at")["standard_instant"].sum(min_count=1).sort_index()
+            flow.index = pd.DatetimeIndex(flow.index)
+            resampled = flow.resample("5min").mean()
+            # 短缺口只允许在同一天内部插值，避免跨日连接夜间边界。
+            resampled = resampled.groupby(resampled.index.normalize(), group_keys=False).apply(
+                lambda values: values.interpolate(limit=2)
+            )
+            site_flows.append(resampled)
+        total = pd.concat(site_flows, axis=1).sum(axis=1, min_count=1).sort_index()
         table = total.to_frame("flow")
         table["slot"] = table.index.hour * 60 + table.index.minute
         table["day"] = table.index.date
@@ -476,29 +512,99 @@ class SmartMeteringService:
             "checklist_json": json.dumps(checklist, ensure_ascii=False),
         }
 
-    def diagnose(self, user_id: str, diagnosis_date: date, save: bool = True) -> Dict[str, Any]:
+    def diagnose(
+        self,
+        user_id: str,
+        diagnosis_date: date,
+        save: bool = True,
+        create_work_order: bool = True,
+    ) -> Dict[str, Any]:
         user_id = str(user_id)
         user = self.repo.get_user(user_id)
         day_long = self.repo.get_day_long(user_id, diagnosis_date)
         if day_long.empty:
             raise ValueError(f"用户 {user_id} 在 {diagnosis_date} 无SCADA数据")
-        wide = long_to_wide(day_long)
         user_name = user.get("station_name") or user_id
-        quality = self.quality_analyzer.process_user_data(wide, user_name)
-        if quality is None:
+        grouped = day_long.copy()
+        if "entity_name" in grouped.columns:
+            site_key = grouped["entity_name"].fillna("").astype(str)
+        elif "source_file" in grouped.columns:
+            site_key = grouped["source_file"].fillna("").astype(str)
+        else:
+            site_key = pd.Series(str(user_name), index=grouped.index)
+        grouped["_site_key"] = site_key.where(site_key.str.len() > 0, str(user_name))
+
+        site_results: List[Dict[str, Any]] = []
+        site_qualities: List[Dict[str, Any]] = []
+        site_flow_series: List[pd.Series] = []
+        for raw_site_name, site_data in grouped.groupby("_site_key", sort=False):
+            site_name = str(raw_site_name)
+            # 修复历史导入时形成的中文乱码，厂区名称仅用于证据展示和告警定位。
+            for _ in range(2):
+                try:
+                    site_name = site_name.encode("gbk").decode("utf-8")
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    break
+            wide = long_to_wide(site_data)
+            quality = self.quality_analyzer.process_user_data(wide, site_name)
+            if quality is None:
+                continue
+            observed_state = self._observed_state(quality)
+            model_state = self.model.predict(quality) if self.use_deep_model else None
+            effective_state = observed_state if model_state is None else int(model_state)
+            site_alerts = self._legacy_anomalies(quality, effective_state)
+            # 数据库侧以标况瞬时流量积分判断计量状态，避免累计量跳变或卡死掩盖“走气未走字”。
+            if model_state == 1 and observed_state == 0:
+                cross_alert = "流量异常：模型识别为用气，但远传瞬时流量未计量，疑似走气未走字"
+                if cross_alert not in site_alerts:
+                    site_alerts.insert(0, cross_alert)
+            site_volume = sum(float(quality.get(f"管道{i}用气量", 0) or 0) for i in range(1, 5))
+            processed = quality.get("处理后数据")
+            flow_columns = [
+                f"{i}号标况瞬时" for i in range(1, 5)
+                if isinstance(processed, pd.DataFrame) and f"{i}号标况瞬时" in processed.columns
+            ]
+            if flow_columns:
+                site_flow_series.append(processed[flow_columns].sum(axis=1, min_count=1))
+            site_evidence = self._joint_diagnostic_evidence(quality, site_alerts)
+            for evidence_items in site_evidence.values():
+                for item in evidence_items:
+                    item["site_name"] = site_name
+            site_score, site_level = self._risk(
+                site_alerts, [], "无表具量程信息", 0.0, int(quality.get("是否有效", 2))
+            )
+            site_results.append({
+                "site_name": site_name,
+                "observed_volume": round(site_volume, 4),
+                "quality_status": int(quality.get("是否有效", 2)),
+                "pipeline_completeness": {str(i): quality.get(f"管道{i}完整度") for i in range(1, 5)},
+                "pipeline_daily_volume": {str(i): quality.get(f"管道{i}用气量") for i in range(1, 5)},
+                "model_state": model_state,
+                "observed_state": observed_state,
+                "effective_state": effective_state,
+                "alerts": site_alerts,
+                "risk_score": round(site_score, 2),
+                "risk_level": site_level,
+                "diagnostic_evidence": site_evidence,
+            })
+            site_qualities.append(quality)
+        if not site_results:
             raise RuntimeError("数据质量分析失败")
 
-        observed_state = self._observed_state(quality)
-        model_state = self.model.predict(quality) if self.use_deep_model else None
+        multi_site = len(site_results) > 1
+        alerts = []
+        for site in site_results:
+            for alert in site["alerts"]:
+                labeled = f"{site['site_name']}：{alert}" if multi_site else alert
+                if labeled not in alerts:
+                    alerts.append(labeled)
+        observed_state = 1 if any(site["observed_state"] == 1 for site in site_results) else 0
+        model_values = [site["model_state"] for site in site_results if site["model_state"] is not None]
+        model_state = (1 if any(value == 1 for value in model_values) else 0) if model_values else None
         effective_state = observed_state if model_state is None else int(model_state)
-        alerts = self._legacy_anomalies(quality, effective_state)
-        # 数据库侧以标况瞬时流量积分判断计量状态，避免累计量跳变或卡死掩盖“走气未走字”。
-        if model_state == 1 and observed_state == 0:
-            cross_alert = "流量异常：模型识别为用气，但远传瞬时流量未计量，疑似走气未走字"
-            if cross_alert not in alerts:
-                alerts.insert(0, cross_alert)
 
-        observed_flow = self._resample_total_flow(day_long)
+        # 企业总流量直接汇总各厂区完成质量处理后的五分钟序列，确保总量与厂区明细严格一致。
+        observed_flow = pd.concat(site_flow_series, axis=1).sum(axis=1, min_count=1).sort_index()
         history = self.repo.get_flow_history(user_id, diagnosis_date, 30)
         predicted_flow, mad, baseline_days = self._history_baseline(history, observed_flow.index)
         observed_volume = float(observed_flow.fillna(0).sum() * 5 / 60)
@@ -507,21 +613,49 @@ class SmartMeteringService:
         run_id = f"RUN-{diagnosis_date:%Y%m%d}-{user_id}-{uuid.uuid4().hex[:8]}"
         intervals = self._detect_intervals(run_id, user_id, observed_flow, predicted_flow, mad, effective_state) if baseline_days >= 3 else []
         baseline_missing = sum(x.estimated_missing_volume for x in intervals)
-        meter_bias, error_model = self._meter_error_bias(user_id, observed_flow)
+        if multi_site:
+            meter_bias, error_model = 0.0, {"available": False, "reason": "多厂区合并数据无法关联到单一检定表具"}
+        else:
+            meter_bias, error_model = self._meter_error_bias(user_id, observed_flow)
         makeup = max(0.0, baseline_missing) + max(0.0, meter_bias)
 
-        spec_history = self.repo.get_history_for_spec(user_id, diagnosis_date, 30)
-        spec_result, spec_metrics = self._meter_spec(user, spec_history)
-        quality_status = int(quality.get("是否有效", 2))
-        risk_score, risk_level = self._risk(alerts, intervals, spec_result, makeup, quality_status)
+        if multi_site:
+            spec_result, spec_metrics = "多厂区合并，表具量程不适用", {}
+        else:
+            spec_history = self.repo.get_history_for_spec(user_id, diagnosis_date, 30)
+            spec_result, spec_metrics = self._meter_spec(user, spec_history)
+        quality_status = 0 if any(site["quality_status"] == 0 for site in site_results) else 2
+        if multi_site:
+            # 企业风险取各厂区最高值，不把不同厂区的风险分数累加。
+            risk_score = max(float(site["risk_score"]) for site in site_results)
+            if risk_score > 0 and intervals:
+                risk_score += min(10, len(intervals) * 2)
+            if risk_score > 0 and makeup >= 100:
+                risk_score += 10
+            risk_score = min(100.0, risk_score)
+            risk_level = "严重" if risk_score >= 80 else "高" if risk_score >= 60 else "中" if risk_score >= 35 else "低"
+        else:
+            risk_score, risk_level = self._risk(alerts, intervals, spec_result, makeup, quality_status)
         work_order = self._work_order(run_id, user_id, diagnosis_date, risk_level, alerts, spec_result, makeup)
+
+        diagnostic_evidence: Dict[str, List[Dict[str, Any]]] = {"flow": [], "pressure": [], "temperature": []}
+        for site in site_results:
+            for evidence_type, evidence_items in site["diagnostic_evidence"].items():
+                diagnostic_evidence.setdefault(evidence_type, []).extend(evidence_items)
+        primary_quality = site_qualities[0]
 
         details = {
             "user": user,
             "data_quality": {
                 "status": quality_status,
-                "pipeline_completeness": {str(i): quality.get(f"管道{i}完整度") for i in range(1, 5)},
-                "pipeline_daily_volume": {str(i): quality.get(f"管道{i}用气量") for i in range(1, 5)},
+                # 单厂区保留旧字段；多厂区必须查看 sites，避免同号管路再次被误解为同一设备。
+                "pipeline_completeness": (
+                    {str(i): primary_quality.get(f"管道{i}完整度") for i in range(1, 5)} if not multi_site else {}
+                ),
+                "pipeline_daily_volume": (
+                    {str(i): primary_quality.get(f"管道{i}用气量") for i in range(1, 5)} if not multi_site else {}
+                ),
+                "sites": site_results,
             },
             "gas_state": {
                 "model_state": model_state,
@@ -531,7 +665,8 @@ class SmartMeteringService:
                 "model_error": self.model.load_error,
             },
             "alerts": alerts,
-            "diagnostic_evidence": self._joint_diagnostic_evidence(quality, alerts),
+            "diagnostic_evidence": diagnostic_evidence,
+            "site_results": site_results,
             "baseline": {"history_days": baseline_days, "predicted_normal_volume": predicted_volume},
             "meter_error_model": error_model,
             "meter_spec": spec_metrics,
@@ -561,7 +696,8 @@ class SmartMeteringService:
             "details": details,
         }
         if save:
-            self._save(result, intervals, work_order)
+            # 诊断证据落库与工单创建分离；网页查看详情只保存诊断，不绕过人工审批创建工单。
+            self._save(result, intervals, work_order if create_work_order else None)
         return result
 
     @staticmethod
@@ -588,7 +724,11 @@ class SmartMeteringService:
             ]
             for old_run_id in old_run_ids:
                 con.execute("DELETE FROM metering.anomaly_interval WHERE run_id=?", [old_run_id])
-                con.execute("DELETE FROM metering.work_order WHERE run_id=?", [old_run_id])
+                if work_order:
+                    con.execute("DELETE FROM metering.work_order WHERE run_id=?", [old_run_id])
+                else:
+                    # 仅刷新诊断时保留历史人工处置记录，并关联到新的诊断运行。
+                    con.execute("UPDATE metering.work_order SET run_id=? WHERE run_id=?", [result["run_id"], old_run_id])
             con.execute("DELETE FROM metering.diagnosis_run WHERE user_id=? AND diagnosis_date=?", [result["user_id"], result["diagnosis_date"]])
             con.execute(
                 """

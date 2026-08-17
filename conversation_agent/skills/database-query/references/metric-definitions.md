@@ -2,11 +2,11 @@
 
 ## 日标况用气量
 
-`standard_instant` 的单位是 m³/h。原始采集可能接近一分钟，必须先按用户、管路和五分钟时间桶求平均，再积分：
+`standard_instant` 的单位是 m³/h。原始采集频率可能不同，同一 `user_id` 也可能包含多个厂区。必须先按用户、`entity_name`、管路和五分钟时间桶求平均，再积分：
 
 `五分钟气量 = max(五分钟平均标况瞬时流量, 0) × 5 / 60`
 
-日用气量等于全部管路、全部五分钟桶气量之和。不能直接对原始行执行 `SUM(standard_instant) * 5 / 60`。
+企业日用气量等于各厂区、各管路、全部五分钟桶气量之和。不能跨厂区合并同号管路，也不能直接对原始行执行 `SUM(standard_instant) * 5 / 60`。
 
 DuckDB 推荐使用：
 
@@ -14,7 +14,7 @@ DuckDB 推荐使用：
 time_bucket(INTERVAL '5 minutes', observed_at)
 ```
 
-每个管路先 `AVG(standard_instant)`，然后 `SUM(GREATEST(flow_5m, 0) * 5.0 / 60.0)`。
+每个厂区的每条管路先 `AVG(standard_instant)`，然后 `SUM(GREATEST(flow_5m, 0) * 5.0 / 60.0)`。算法详情还会对不超过两个五分钟桶的短缺口插值，因此纯 SQL 复算必须注明是否包含短缺口修复。
 
 ## 完整度与有效数据
 

@@ -80,6 +80,22 @@ export function MeteringPage(props: MeteringPageProps) {
 
   const meterSpec = diagnosis.details?.meter_spec || {}
   const completeness = diagnosis.details?.data_quality?.pipeline_completeness || {}
+  const siteResults = diagnosis.details?.site_results || []
+  const completenessItems = siteResults.length > 1
+    ? siteResults.flatMap((site) => Object.entries(site.pipeline_completeness || {})
+      .filter(([, value]) => Number(value || 0) > 0)
+      .map(([pipeline, value]) => ({
+        label: `${site.site_name} · 管路 ${pipeline}`,
+        value: Number(value || 0) * 100,
+        tone: Number(value || 0) >= 0.9 ? 'green' as const : 'amber' as const,
+        display: `${formatNumber(Number(value || 0) * 100)}%`,
+      })))
+    : Object.entries(completeness).map(([pipeline, value]) => ({
+      label: `管路 ${pipeline}`,
+      value: Number(value || 0) * 100,
+      tone: Number(value || 0) >= 0.9 ? 'green' as const : 'amber' as const,
+      display: `${formatNumber(Number(value || 0) * 100)}%`,
+    }))
   const observed = Number(diagnosis.observed_volume || 0)
   const expected = Number(diagnosis.predicted_normal_volume || 0)
   const drop = expected > 0 ? Math.max(0, ((expected - observed) / expected) * 100) : 0
@@ -90,11 +106,25 @@ export function MeteringPage(props: MeteringPageProps) {
       {error && <div className="inline-error">部分数据刷新失败，当前显示上次结果：{error}</div>}
       <div className="section-heading"><div><small>METERING DIAGNOSTIC EVIDENCE</small><h2>智能计量详情</h2></div><span className={`risk-pill risk-${diagnosis.risk_level}`}>{diagnosis.risk_level}风险 · {diagnosis.status}</span></div>
       <KpiGrid items={[
-        { label: '当日观测用气量', value: formatNumber(diagnosis.observed_volume), note: 'SCADA 流量积分 · m³', tone: 'cyan' },
+        { label: '当日观测用气量', value: formatNumber(diagnosis.observed_volume), note: `${siteResults.length > 1 ? `${siteResults.length} 个厂区汇总 · ` : ''}SCADA 流量积分 · m³`, tone: 'cyan' },
         { label: '预测正常用气量', value: formatNumber(diagnosis.predicted_normal_volume), note: `历史基线 ${diagnosis.details?.baseline?.history_days || 0} 天 · m³`, tone: 'blue' },
         { label: '估算补气量', value: formatNumber(diagnosis.makeup_volume), note: `基线缺口 ${formatNumber(diagnosis.baseline_missing_volume)} + 表误差 ${formatNumber(diagnosis.meter_bias_volume)} m³`, tone: 'amber' },
         { label: '综合风险', value: diagnosis.risk_level, note: `风险评分 ${formatNumber(diagnosis.risk_score, 0)} / 100`, tone: diagnosis.risk_score >= 60 ? 'red' : diagnosis.risk_score >= 35 ? 'amber' : 'green' },
       ]} />
+
+      {siteResults.length > 1 && <Panel title="厂区诊断汇总" eyebrow="企业统一展示，厂区独立计算，风险取最高值" className="table-panel">
+        <DataTable minWidth={760}>
+          <thead><tr><th>厂区</th><th>当日用气量</th><th>风险</th><th>诊断结论</th></tr></thead>
+          <tbody>{siteResults.map((site) => (
+            <tr key={site.site_name}>
+              <td>{site.site_name}</td>
+              <td>{formatNumber(site.observed_volume)} m³</td>
+              <td>{site.risk_level} · {formatNumber(site.risk_score, 0)}</td>
+              <td>{site.alerts.length ? site.alerts.join('；') : '未发现可推送异常'}</td>
+            </tr>
+          ))}</tbody>
+        </DataTable>
+      </Panel>}
 
       <Panel title="算法原始结论" eyebrow="不依赖 Agent，始终来自计量诊断流程" aside={<span className="algorithm-badge">ALGORITHM</span>}>
         <div className="mechanism-lead"><strong>核心结论</strong><p>{diagnosis.summary}</p></div>
@@ -146,7 +176,7 @@ export function MeteringPage(props: MeteringPageProps) {
           )}
         </Panel>
         <Panel title="数据质量" eyebrow="各管路完整度">
-          {Object.keys(completeness).length ? <PercentBars items={Object.entries(completeness).map(([pipeline, value]) => ({ label: `管路 ${pipeline}`, value: Number(value || 0) * 100, tone: Number(value || 0) >= 0.9 ? 'green' : 'amber', display: `${formatNumber(Number(value || 0) * 100)}%` }))} /> : <div className="panel-empty">没有管路完整度结果</div>}
+          {completenessItems.length ? <PercentBars items={completenessItems} /> : <div className="panel-empty">没有管路完整度结果</div>}
         </Panel>
       </div>
 
@@ -172,7 +202,11 @@ function SignalPanels({ signals }: { signals: MeteringSignals | null }) {
   const entries = useMemo(() => Object.entries(signals?.pipelines || {}), [signals])
   const labels = signals?.times || []
   const colors = ['#21d4d0', '#f2ad35', '#3f91ff', '#a67cff']
-  const definitions = (field: 'flow' | 'pressure' | 'temperature') => entries.map(([pipeline, values], index) => ({ name: `管道 ${pipeline}`, data: values[field], color: colors[index] }))
+  const definitions = (field: 'flow' | 'pressure' | 'temperature') => entries.map(([pipeline, values], index) => ({
+    name: pipeline.includes(' / ') ? pipeline.replace(' / ', ' · 管道 ') : `管道 ${pipeline}`,
+    data: values[field],
+    color: colors[index % colors.length],
+  }))
   return (
     <div className="signal-stack">
       <Panel title="当天各管路瞬时流量曲线" eyebrow="用于识别双管流量失衡、计数时长不符与疑似阻塞" aside={<span className="unit-label">m³/h</span>}>

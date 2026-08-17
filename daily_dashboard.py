@@ -7,11 +7,12 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import pandas as pd
 
 from smart_metering import DataQualityAnalyzer, SmartMeteringService, long_to_wide
 from anomaly_detector import AnomalyDetector
 
-DAILY_OVERVIEW_ALGORITHM_VERSION = "metering-consistency-v2-module-top5"
+DAILY_OVERVIEW_ALGORITHM_VERSION = "metering-site-aware-v5-issue-display"
 
 
 class DailyDiagnosisDashboard:
@@ -156,38 +157,84 @@ class DailyDiagnosisDashboard:
             ).df()
         analyzer = DataQualityAnalyzer()
         detector = AnomalyDetector()
+        equipment_index = json.loads(self.equipment_index.read_text(encoding="utf-8"))
+        equipment_names = {
+            str(item.get("user_id")): self._repair(item.get("company_name"))
+            for item in equipment_index.get("users", [])
+            if item.get("user_id") is not None and item.get("company_name")
+        }
         output = {}
         for user_id, group in day_long.groupby("user_id", sort=False):
-            try:
-                wide = long_to_wide(group)
-                company = group["station_name"].dropna().iloc[0] if group["station_name"].notna().any() else str(user_id)
-                quality = analyzer.process_user_data(wide, company)
-                if not quality or int(quality.get("是否有效", 2)) != 0:
+            station_names = group["station_name"].dropna()
+            scada_names = group["entity_name"].dropna() if "entity_name" in group else pd.Series(dtype=str)
+            # 部分新编号尚未进入企业表具档案，但设备档案和 SCADA 文件仍有可用名称。
+            company = (
+                station_names.iloc[0]
+                if not station_names.empty
+                else equipment_names.get(str(user_id))
+                or (self._repair(str(scada_names.iloc[0])) if not scada_names.empty else str(user_id))
+            )
+            site_key = group["entity_name"].fillna("").astype(str) if "entity_name" in group else group["source_file"].fillna("").astype(str)
+            grouped = group.copy()
+            grouped["_site_key"] = site_key.where(site_key.str.len() > 0, str(company))
+            site_results = []
+            for raw_site_name, site_data in grouped.groupby("_site_key", sort=False):
+                try:
+                    site_name = self._repair(str(raw_site_name))
+                    wide = long_to_wide(site_data)
+                    quality = analyzer.process_user_data(wide, site_name)
+                    if not quality or int(quality.get("是否有效", 2)) != 0:
+                        continue
+                    observed_volume = sum(
+                        float(quality.get(f"管道{i}用气量", 0) or 0) for i in range(1, 5)
+                    )
+                    observed_state = 1 if observed_volume > 1e-6 else 0
+                    raw_alerts = detector.check_user(site_name, observed_state, quality, None)
+                except Exception:
                     continue
-                observed_state = 1 if sum(float(quality.get(f"管道{i}用气量", 0) or 0) for i in range(1, 5)) > 1e-6 else 0
-                raw_alerts = detector.check_user(str(company), observed_state, quality, None)
-            except Exception:
+                alerts = [a for a in raw_alerts if "不做诊断" not in a]
+                # 单一温度特征易受环境与工况影响，只在与流量/压力异常共现时推送。
+                hard_alerts = [a for a in alerts if "流量异常" in a or "压力异常" in a]
+                site_score, site_level = SmartMeteringService._risk(
+                    hard_alerts, [], "无表具量程信息", 0.0, int(quality.get("是否有效", 2))
+                )
+                site_results.append({
+                    "site_name": site_name,
+                    "observed_volume": round(observed_volume, 2),
+                    "alerts": hard_alerts,
+                    "risk_score": round(site_score, 2),
+                    "risk_level": site_level,
+                    "pipeline_daily_volume": {
+                        str(i): round(float(quality.get(f"管道{i}用气量", 0) or 0), 2) for i in range(1, 5)
+                    },
+                })
+            if not site_results or not any(site["alerts"] for site in site_results):
                 continue
-            alerts = [a for a in raw_alerts if "不做诊断" not in a]
-            # 单一温度特征易受环境与工况影响，只在与流量/压力异常共现时推送。
-            has_hard = any("流量异常" in a or "压力异常" in a for a in alerts)
-            if not has_hard:
-                continue
-            # 总览复用详情的主告警权重，避免同一告警在两个页面得到不同风险等级。
-            score, risk_level = SmartMeteringService._risk(alerts, [], "无表具量程信息", 0.0, 0)
-            score = round(score, 2)
-            # 与详情页统一：按各管路标况瞬时流量合计后，以 5 分钟采样间隔积分。
-            volume_frame = group[["observed_at", "standard_instant"]].copy()
-            volume_frame["standard_instant"] = volume_frame["standard_instant"].fillna(0).clip(lower=0)
-            observed_volume = float(volume_frame.groupby("observed_at")["standard_instant"].sum().sum() * 5.0 / 60.0)
-            primary = alerts[0]
+            multi_site = len(site_results) > 1
+            alerts = []
+            for site in site_results:
+                for alert in site["alerts"]:
+                    alerts.append(f"{site['site_name']}：{alert}" if multi_site else alert)
+            # 企业风险取厂区最高值；企业气量则是各厂区重采样积分之和。
+            score = max(float(site["risk_score"]) for site in site_results)
+            risk_level = "严重" if score >= 80 else "高" if score >= 60 else "中" if score >= 35 else "低"
+            observed_volume = sum(float(site["observed_volume"]) for site in site_results)
+            primary_site = next(site for site in site_results if site["alerts"])
+            # 企业名称已经在独立列展示，主要问题只保留异常内容；厂区来源放入证据摘要。
+            primary = primary_site["alerts"][0]
+            evidence_summary = (
+                "；".join(f"问题厂区：{site['site_name']}；{alert}" for site in site_results for alert in site["alerts"])
+                if multi_site else "；".join(alerts[:3])
+            )
             output[str(user_id)] = {
                 "user_id": str(user_id), "company_name": self._repair(str(company)), "module": "metering",
                 "issue_type": primary, "issue_tags": alerts, "risk_score": score,
                 "risk_level": risk_level,
                 "primary_metric": round(observed_volume, 2), "primary_metric_name": "当日计量气量",
                 "observed_volume": round(observed_volume, 2),
-                "evidence_summary": "；".join(alerts[:3]),
+                "evidence_summary": evidence_summary,
+                "affected_sites": [site["site_name"] for site in site_results if site["alerts"]],
+                "site_results": site_results,
             }
         return output
 
@@ -229,19 +276,37 @@ class DailyDiagnosisDashboard:
     def metering_history(self, user_id: str, target: date, days: int = 7) -> list[dict[str, Any]]:
         start = target - timedelta(days=days-1)
         with duckdb.connect(str(self.input_db), read_only=True) as con:
-            rows = con.execute(
+            history = con.execute(
                 """
-                WITH slot_flow AS (
-                  SELECT data_date,observed_at,SUM(GREATEST(COALESCE(standard_instant,0),0)) total_flow
-                  FROM telemetry.scada_observation WHERE user_id=? AND data_date BETWEEN ? AND ?
-                  GROUP BY data_date,observed_at
-                )
-                SELECT data_date,SUM(total_flow)*5.0/60.0 volume,AVG(total_flow) avg_flow,
-                       MAX(total_flow) max_flow,COUNT(*) slots,
-                       AVG(CASE WHEN total_flow>0 THEN 1.0 ELSE 0.0 END) active_ratio
-                FROM slot_flow GROUP BY data_date ORDER BY data_date
+                SELECT data_date,observed_at,entity_name,source_file,pipeline_no,
+                       pressure,temperature,operational_instant,operational_cumulative,
+                       standard_instant,standard_cumulative
+                FROM telemetry.scada_observation
+                WHERE user_id=? AND data_date BETWEEN ? AND ?
+                ORDER BY data_date,entity_name,observed_at,pipeline_no
                 """, [str(user_id), start, target]
-            ).fetchall()
-        return [{"date":str(r[0]),"volume":round(float(r[1] or 0),2),"avg_flow":round(float(r[2] or 0),2),
-                 "max_flow":round(float(r[3] or 0),2),"completeness":round(min(1,float(r[4] or 0)/288)*100,2),
-                 "active_ratio":round(float(r[5] or 0)*100,2)} for r in rows]
+            ).df()
+        analyzer = DataQualityAnalyzer()
+        rows = []
+        for data_date, day in history.groupby("data_date", sort=True):
+            site_flows = []
+            for site_name, site_data in day.groupby("entity_name", dropna=False, sort=False):
+                quality = analyzer.process_user_data(long_to_wide(site_data), self._repair(str(site_name)))
+                processed = quality.get("处理后数据") if quality else None
+                if not isinstance(processed, pd.DataFrame) or processed.empty:
+                    continue
+                flow_columns = [f"{i}号标况瞬时" for i in range(1, 5) if f"{i}号标况瞬时" in processed.columns]
+                if flow_columns:
+                    site_flows.append(processed[flow_columns].sum(axis=1, min_count=1))
+            if not site_flows:
+                continue
+            total = pd.concat(site_flows, axis=1).sum(axis=1, min_count=1)
+            rows.append({
+                "date": str(pd.Timestamp(data_date).date()),
+                "volume": round(float(total.fillna(0).sum() * 5.0 / 60.0), 2),
+                "avg_flow": round(float(total.mean() or 0), 2),
+                "max_flow": round(float(total.max() or 0), 2),
+                "completeness": round(float(total.notna().mean()) * 100, 2),
+                "active_ratio": round(float((total.fillna(0) > 0).mean()) * 100, 2),
+            })
+        return rows

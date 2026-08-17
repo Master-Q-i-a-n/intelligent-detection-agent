@@ -123,6 +123,15 @@ def initialize_work_order_schema(result_database: Path) -> None:
             )
             """
         )
+        # 修复旧调用只把用户号放在 source_reference 中，导致顶层 user_id 为空的历史工单。
+        connection.execute(
+            """
+            UPDATE operations.work_order
+            SET user_id = json_extract_string(source_reference_json, '$.user_id')
+            WHERE user_id IS NULL
+              AND json_extract_string(source_reference_json, '$.user_id') IS NOT NULL
+            """
+        )
 
 
 def _query_tool_result(executor: ReadOnlyQueryExecutor, source: DatabaseSource, sql: str) -> tuple[str, dict[str, Any]]:
@@ -236,8 +245,12 @@ def build_agent_tools(root: Path) -> list[Any]:
         title = title.strip()
         description = description.strip()
         checklist = [item.strip() for item in checklist if item.strip()]
+        user_id = str(user_id or source_reference.get("user_id") or "").strip() or None
+        if source_module in {"metering", "equipment"} and user_id is None:
+            raise ValueError("计量或设备工单必须提供 user_id，可放在顶层参数或 source_reference.user_id。")
         if not title or not description or not checklist:
             raise ValueError("工单标题、说明和至少一项检查清单不能为空。")
+        source_reference_json = json.dumps(source_reference, ensure_ascii=False, default=str)
         normalized = json.dumps(
             {
                 "source_module": source_module,
@@ -256,8 +269,15 @@ def build_agent_tools(root: Path) -> list[Any]:
         work_order_id = f"CWO-{datetime.now():%Y%m%d}-{idempotency_key[:10]}"
         with WORK_ORDER_LOCK, duckdb.connect(str(result_database)) as connection:
             existing = connection.execute(
-                "SELECT work_order_id,status,created_at FROM operations.work_order WHERE idempotency_key=?",
-                [idempotency_key],
+                """
+                SELECT work_order_id,status,created_at
+                FROM operations.work_order
+                WHERE idempotency_key=?
+                   OR (source_module=? AND user_id=? AND title=? AND source_reference_json=?)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                [idempotency_key, source_module, user_id, title, source_reference_json],
             ).fetchone()
             if existing:
                 payload = {
@@ -279,7 +299,7 @@ def build_agent_tools(root: Path) -> list[Any]:
                     idempotency_key,
                     source_module,
                     user_id,
-                    json.dumps(source_reference, ensure_ascii=False, default=str),
+                    source_reference_json,
                     priority,
                     "OPEN",
                     title,

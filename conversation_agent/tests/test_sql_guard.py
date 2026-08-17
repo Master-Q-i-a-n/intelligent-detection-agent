@@ -115,12 +115,17 @@ def test_five_minute_sql_matches_metering_algorithm_for_one_user_day() -> None:
     result = executor.execute(
         "business",
         f"""
-        WITH five_minute AS (
-          SELECT pipeline_no,time_bucket(INTERVAL '5 minutes', observed_at) AS bucket,
-                 AVG(CASE WHEN standard_instant >= 0 THEN standard_instant END) AS flow_5m
+        WITH site_timestamp AS (
+          SELECT entity_name,observed_at,
+                 SUM(CASE WHEN standard_instant >= 0 THEN standard_instant END) AS site_flow
           FROM telemetry.scada_observation
           WHERE user_id='{user_id}' AND data_date=DATE '{diagnosis_date}'
-          GROUP BY pipeline_no,bucket
+          GROUP BY entity_name,observed_at
+        ), five_minute AS (
+          SELECT entity_name,time_bucket(INTERVAL '5 minutes', observed_at) AS bucket,
+                 AVG(site_flow) AS flow_5m
+          FROM site_timestamp
+          GROUP BY entity_name,bucket
         )
         SELECT SUM(COALESCE(GREATEST(flow_5m,0),0)*5.0/60.0) AS volume_m3
         FROM five_minute

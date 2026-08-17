@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent
 
 import duckdb
 import numpy as np
+import pandas as pd
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -87,7 +88,7 @@ fast_service = SmartMeteringService(use_deep_model=False)
 daily_dashboard_service = DailyDiagnosisDashboard(ROOT)
 diagnosis_lock = threading.RLock()
 diagnosis_cache: Dict[str, Dict[str, Any]] = {}
-METERING_DETAIL_ALGORITHM_VERSION = "metering-consistency-v1"
+METERING_DETAIL_ALGORITHM_VERSION = "metering-site-aware-v2"
 DETAIL_CACHE_ROOT = ROOT / "reports" / "metering_detail_cache_v3"
 DETAIL_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -128,12 +129,14 @@ class DiagnosisRequest(BaseModel):
     diagnosis_date: date
     save: bool = True
     deep_model: bool = False
+    create_work_order: bool = False
 
 
 class BatchDiagnosisRequest(BaseModel):
     user_ids: List[str]
     diagnosis_date: date
     save: bool = True
+    create_work_order: bool = False
 
 
 class InspectionRequest(BaseModel):
@@ -387,7 +390,8 @@ def health():
 
 
 @app.get("/api/users")
-def users(limit: int = 1000):
+def users(limit: int = 1000, module: Optional[Literal["metering", "equipment"]] = None):
+    """按业务模块返回可诊断企业；不传模块时保留原有交集口径。"""
     payload = _load_json(EQUIPMENT_INDEX)
     equipment_items = {str(item["user_id"]): item for item in payload.get("users", [])}
     with duckdb.connect(str(INPUT_DB), read_only=True) as con:
@@ -401,16 +405,34 @@ def users(limit: int = 1000):
             ORDER BY s.user_id
             """
         ).fetchall()
+    bounded_limit = max(1, min(limit, 2000))
+    if module == "equipment":
+        items = []
+        for equipment in payload.get("users", []):
+            item = dict(equipment)
+            item["company_name"] = _repair_text(item.get("company_name") or str(item.get("user_id")))
+            item["date_range"] = payload.get("date_range", [])
+            items.append(item)
+            if len(items) >= bounded_limit:
+                break
+        return {
+            "items": items,
+            "count": len(items),
+            "enterprise_count": len(items),
+            "date_range": payload.get("date_range", []),
+        }
+
     items = []
     for user_id, station_name, start_date, end_date in metering_rows:
         equipment = equipment_items.get(str(user_id))
-        if equipment is None:
+        if module is None and equipment is None:
             continue
-        item = dict(equipment)
-        item["company_name"] = _repair_text(station_name or equipment.get("company_name") or str(user_id))
+        item = dict(equipment or {})
+        item["user_id"] = str(user_id)
+        item["company_name"] = _repair_text(station_name or (equipment or {}).get("company_name") or str(user_id))
         item["date_range"] = [str(start_date), str(end_date)]
         items.append(item)
-        if len(items) >= max(1, min(limit, 2000)):
+        if len(items) >= bounded_limit:
             break
     return {
         "items": items,
@@ -436,12 +458,25 @@ def metering_signals(user_id: str, diagnosis_date: date, max_points: int = 1000)
     day_long = service.repo.get_day_long(user_id, diagnosis_date)
     if day_long.empty:
         raise HTTPException(status_code=404, detail="该企业当天无SCADA曲线数据")
-    wide = long_to_wide(day_long)
     user = service.repo.get_user(user_id)
-    quality = service.quality_analyzer.process_user_data(wide, user.get("station_name") or str(user_id))
-    frame = quality.get("处理后数据") if quality else None
-    if frame is None or frame.empty:
+    grouped = day_long.copy()
+    if "entity_name" in grouped.columns:
+        site_key = grouped["entity_name"].fillna("").astype(str)
+    elif "source_file" in grouped.columns:
+        site_key = grouped["source_file"].fillna("").astype(str)
+    else:
+        site_key = pd.Series(str(user.get("station_name") or user_id), index=grouped.index)
+    grouped["_site_key"] = site_key.where(site_key.str.len() > 0, str(user.get("station_name") or user_id))
+    site_frames = []
+    for raw_site_name, site_data in grouped.groupby("_site_key", sort=False):
+        site_name = _repair_text(str(raw_site_name))
+        quality = service.quality_analyzer.process_user_data(long_to_wide(site_data), site_name)
+        frame = quality.get("处理后数据") if quality else None
+        if frame is not None and not frame.empty:
+            site_frames.append((site_name, frame))
+    if not site_frames:
         raise HTTPException(status_code=422, detail="当天数据未通过质量处理，无法生成诊断曲线")
+    frame = site_frames[0][1]
     times = list(frame.index)
     # 默认保留当天重采样后的全部时刻；仅在调用方显式限制时才抽稀。
     step = max(1, math.ceil(len(times) / max(24, min(max_points, 2000))))
@@ -453,22 +488,26 @@ def metering_signals(user_id: str, diagnosis_date: date, max_points: int = 1000)
         "times": [str(item)[11:16] for item in selected_times],
         "resample_frequency": "5min",
         "point_count": len(selected_times),
+        "site_count": len(site_frames),
         "pipelines": {},
     }
-    for pipeline_no in range(1, 5):
-        flow_col, pressure_col, temperature_col = (
-            f"{pipeline_no}号标况瞬时", f"{pipeline_no}号压力", f"{pipeline_no}号温度"
-        )
-        if not any(column in selected.columns for column in (flow_col, pressure_col, temperature_col)):
-            continue
-        flow = selected[flow_col] if flow_col in selected.columns else None
-        pressure = selected[pressure_col] if pressure_col in selected.columns else None
-        temperature = selected[temperature_col] if temperature_col in selected.columns else None
-        payload["pipelines"][str(pipeline_no)] = {
-            "flow": flow.fillna(0).astype(float).round(4).tolist() if flow is not None else [0.0] * len(selected),
-            "pressure": pressure.astype(float).round(4).where(pressure.notna(), None).tolist() if pressure is not None else [None] * len(selected),
-            "temperature": temperature.astype(float).round(4).where(temperature.notna(), None).tolist() if temperature is not None else [None] * len(selected),
-        }
+    for site_name, site_frame in site_frames:
+        selected = site_frame.reindex(selected_times).copy()
+        for pipeline_no in range(1, 5):
+            flow_col, pressure_col, temperature_col = (
+                f"{pipeline_no}号标况瞬时", f"{pipeline_no}号压力", f"{pipeline_no}号温度"
+            )
+            if not any(column in selected.columns for column in (flow_col, pressure_col, temperature_col)):
+                continue
+            flow = selected[flow_col] if flow_col in selected.columns else None
+            pressure = selected[pressure_col] if pressure_col in selected.columns else None
+            temperature = selected[temperature_col] if temperature_col in selected.columns else None
+            pipeline_key = str(pipeline_no) if len(site_frames) == 1 else f"{site_name} / {pipeline_no}"
+            payload["pipelines"][pipeline_key] = {
+                "flow": flow.fillna(0).astype(float).round(4).tolist() if flow is not None else [0.0] * len(selected),
+                "pressure": pressure.astype(float).round(4).where(pressure.notna(), None).tolist() if pressure is not None else [None] * len(selected),
+                "temperature": temperature.astype(float).round(4).where(temperature.notna(), None).tolist() if temperature is not None else [None] * len(selected),
+            }
     return _json_safe(payload)
 
 
@@ -499,7 +538,12 @@ def diagnose(request: DiagnosisRequest):
             if not request.save and cache_key in diagnosis_cache and _is_current_metering_detail(diagnosis_cache[cache_key]):
                 return diagnosis_cache[cache_key]
             diagnosis_service = service if request.deep_model else fast_service
-            result = _stamp_metering_detail(_json_safe(diagnosis_service.diagnose(request.user_id, request.diagnosis_date, request.save)))
+            result = _stamp_metering_detail(_json_safe(diagnosis_service.diagnose(
+                request.user_id,
+                request.diagnosis_date,
+                save=request.save,
+                create_work_order=request.create_work_order,
+            )))
             diagnosis_cache[cache_key] = result
             disk_cache.parent.mkdir(parents=True, exist_ok=True)
             disk_cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -516,7 +560,12 @@ def diagnose_batch(request: BatchDiagnosisRequest):
     for user_id in request.user_ids:
         try:
             with diagnosis_lock:
-                result = _stamp_metering_detail(_json_safe(service.diagnose(user_id, request.diagnosis_date, request.save)))
+                result = _stamp_metering_detail(_json_safe(service.diagnose(
+                    user_id,
+                    request.diagnosis_date,
+                    save=request.save,
+                    create_work_order=request.create_work_order,
+                )))
                 diagnosis_cache[f"{user_id}:{request.diagnosis_date}"] = result
                 outputs.append(result)
         except Exception as exc:

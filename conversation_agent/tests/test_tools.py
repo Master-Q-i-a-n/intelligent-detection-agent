@@ -71,6 +71,26 @@ def test_work_order_tool_is_idempotent(tmp_path) -> None:
         assert connection.execute("SELECT COUNT(*) FROM operations.work_order_audit").fetchone()[0] == 1
 
 
+def test_work_order_uses_user_id_from_source_reference(tmp_path) -> None:
+    (tmp_path / "database").mkdir()
+    result_db = tmp_path / "database" / "gas_ai_results.duckdb"
+    duckdb.connect(str(result_db)).close()
+    tools = {item.name: item for item in build_agent_tools(tmp_path)}
+
+    payload = json.loads(tools["create_work_order"].invoke({
+        "source_module": "metering",
+        "priority": "P3",
+        "title": "流量异常核查",
+        "description": "依据遥测证据开展现场核查。",
+        "checklist": ["核对现场表计"],
+        "source_reference": {"user_id": "1072548130", "diagnosis_date": "2025-01-12"},
+    }))
+
+    assert payload["user_id"] == "1072548130"
+    with duckdb.connect(str(result_db), read_only=True) as connection:
+        assert connection.execute("SELECT user_id FROM operations.work_order").fetchone()[0] == "1072548130"
+
+
 def test_agent_rewrites_failed_duckdb_sql_once_and_completes(tmp_path: Path) -> None:
     _create_diagnosis_database(tmp_path)
     tools = {item.name: item for item in build_agent_tools(tmp_path)}

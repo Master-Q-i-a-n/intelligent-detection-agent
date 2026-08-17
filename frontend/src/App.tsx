@@ -29,7 +29,8 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null)
   const [authChecking, setAuthChecking] = useState(true)
   const [page, setPage] = useState<PageKey>('overview')
-  const [users, setUsers] = useState<UserSummary[]>([])
+  const [meteringUsers, setMeteringUsers] = useState<UserSummary[]>([])
+  const [equipmentUsers, setEquipmentUsers] = useState<UserSummary[]>([])
   const [globalRange, setGlobalRange] = useState<[string, string] | []>([])
   const [userId, setUserId] = useState('')
   const [date, setDate] = useState('')
@@ -65,13 +66,18 @@ export default function App() {
     if (!currentUser) return
     const controller = new AbortController()
     setInitializing(true)
-    api.users(controller.signal)
-      .then((result) => {
-        const nextUsers = result.items || []
+    Promise.all([
+      api.users('metering', controller.signal),
+      api.users('equipment', controller.signal),
+    ])
+      .then(([meteringResult, equipmentResult]) => {
+        const nextUsers = meteringResult.items || []
         const firstUser = nextUsers[0]
-        const initialDates = datesBetween(firstUser?.date_range || result.date_range)
-        setUsers(nextUsers)
-        setGlobalRange(result.date_range)
+        const range = meteringResult.date_range.length ? meteringResult.date_range : equipmentResult.date_range
+        const initialDates = datesBetween(firstUser?.date_range || range)
+        setMeteringUsers(nextUsers)
+        setEquipmentUsers(equipmentResult.items || [])
+        setGlobalRange(range)
         setUserId(firstUser?.user_id || '')
         setDate(initialDates.at(-1) || '')
         if (!initialDates.length) setInitialError('接口未返回有效检测日期，未发起任何无日期请求。')
@@ -85,8 +91,12 @@ export default function App() {
     return () => controller.abort()
   }, [currentUser])
 
+  const users = page === 'equipment' ? equipmentUsers : meteringUsers
   const selectedUser = useMemo(() => users.find((user) => user.user_id === userId), [userId, users])
-  const dates = useMemo(() => datesBetween(selectedUser?.date_range || globalRange), [globalRange, selectedUser])
+  const dates = useMemo(
+    () => datesBetween(page === 'metering' || page === 'equipment' ? (selectedUser?.date_range || globalRange) : globalRange),
+    [globalRange, page, selectedUser],
+  )
   const activeAgentKey = page === 'metering' || page === 'equipment' ? `${page}:${userId}:${date}` : ''
 
   const changeUser = useCallback((nextUserId: string) => {
@@ -95,6 +105,18 @@ export default function App() {
     const nextDates = datesBetween(nextUser?.date_range || globalRange)
     setDate((current) => nextDates.includes(current) ? current : (nextDates.at(-1) || ''))
   }, [globalRange, users])
+
+  const changePage = useCallback((nextPage: PageKey) => {
+    const nextUsers = nextPage === 'equipment' ? equipmentUsers : meteringUsers
+    // 企业名单仍在初始化时只切换页面，不用空列表覆盖稍后返回的默认企业。
+    if ((nextPage === 'metering' || nextPage === 'equipment') && nextUsers.length > 0 && !nextUsers.some((user) => user.user_id === userId)) {
+      const firstUser = nextUsers[0]
+      const nextDates = datesBetween(firstUser?.date_range || globalRange)
+      setUserId(firstUser?.user_id || '')
+      setDate(nextDates.at(-1) || '')
+    }
+    setPage(nextPage)
+  }, [equipmentUsers, globalRange, meteringUsers, userId])
 
   const changeAutoAgent = useCallback((enabled: boolean) => {
     setAutoAgentEnabled(enabled)
@@ -199,9 +221,13 @@ export default function App() {
   }, [currentUser])
 
   const openIssue = useCallback((nextPage: PageKey, nextUserId: string) => {
-    changeUser(nextUserId)
+    const nextUsers = nextPage === 'equipment' ? equipmentUsers : meteringUsers
+    const nextUser = nextUsers.find((user) => user.user_id === nextUserId)
+    const nextDates = datesBetween(nextUser?.date_range || globalRange)
+    setUserId(nextUserId)
+    setDate((current) => nextDates.includes(current) ? current : (nextDates.at(-1) || ''))
     setPage(nextPage)
-  }, [changeUser])
+  }, [equipmentUsers, globalRange, meteringUsers])
 
   async function logout() {
     agentControllers.current.forEach((controller) => controller.abort())
@@ -210,7 +236,8 @@ export default function App() {
     } finally {
       setCurrentUser(null)
       setAgentRecords({})
-      setUsers([])
+      setMeteringUsers([])
+      setEquipmentUsers([])
       setPage('overview')
       setSecurityToast(null)
     }
@@ -220,7 +247,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <Sidebar page={page} onPageChange={setPage} autoAgentEnabled={autoAgentEnabled} onAutoAgentChange={changeAutoAgent} safetyBadge={securityOverviewState?.new_count || 0} currentUser={currentUser} onLogout={() => void logout()} />
+      <Sidebar page={page} onPageChange={changePage} autoAgentEnabled={autoAgentEnabled} onAutoAgentChange={changeAutoAgent} safetyBadge={securityOverviewState?.new_count || 0} currentUser={currentUser} onLogout={() => void logout()} />
       {!currentUser ? <AuthPage onAuthenticated={setCurrentUser} /> : initializing ? <div className="boot-screen"><LoadingState label="正在建立数据链路" /></div> : <main className="main-shell">
         <Topbar
           page={page}

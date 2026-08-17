@@ -6,18 +6,18 @@
 
 ```sql
 WITH five_minute AS (
-  SELECT user_id, pipeline_no,
+  SELECT user_id, entity_name, pipeline_no,
          time_bucket(INTERVAL '5 minutes', observed_at) AS bucket,
          AVG(CASE WHEN standard_instant >= 0 THEN standard_instant END) AS flow_5m
   FROM telemetry.scada_observation
   WHERE data_date = DATE '2025-01-12'
-  GROUP BY user_id, pipeline_no, bucket
+  GROUP BY user_id, entity_name, pipeline_no, bucket
 ), pipeline_quality AS (
-  SELECT user_id, pipeline_no,
+  SELECT user_id, entity_name, pipeline_no,
          COUNT(flow_5m) / 288.0 AS completeness,
          SUM(COALESCE(GREATEST(flow_5m, 0), 0) * 5.0 / 60.0) AS volume_m3
   FROM five_minute
-  GROUP BY user_id, pipeline_no
+  GROUP BY user_id, entity_name, pipeline_no
 ), daily AS (
   SELECT user_id, SUM(volume_m3) AS volume_m3,
          MAX(completeness) AS best_pipeline_completeness

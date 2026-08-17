@@ -75,6 +75,15 @@ export interface MeteringDiagnosis {
       pipeline_completeness?: Record<string, number | null>
       pipeline_daily_volume?: Record<string, number | null>
     }
+    site_results?: Array<{
+      site_name: string
+      observed_volume: number
+      risk_score: number
+      risk_level: string
+      alerts: string[]
+      pipeline_completeness?: Record<string, number | null>
+      pipeline_daily_volume?: Record<string, number | null>
+    }>
     gas_state?: Record<string, unknown>
     diagnostic_evidence?: Record<string, unknown[]>
     meter_error_model?: Record<string, unknown>
@@ -111,6 +120,7 @@ export interface MeteringSignals {
   times: string[]
   resample_frequency: string
   point_count: number
+  site_count?: number
   pipelines: Record<string, PipelineSignals>
 }
 

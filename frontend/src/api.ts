@@ -137,7 +137,10 @@ export const api = {
       method: 'POST', body: JSON.stringify({ username, password }), signal,
     }),
   logout: (signal?: AbortSignal) => requestJson<void>('/auth/logout', { method: 'POST', signal }),
-  users: (signal?: AbortSignal) => requestJson<UserListResponse>('/api/users', { signal }),
+  users: (module?: 'metering' | 'equipment', signal?: AbortSignal) => {
+    const query = module ? `?module=${encodeURIComponent(module)}` : ''
+    return requestJson<UserListResponse>(`/api/users${query}`, { signal })
+  },
   overview: (date: string, signal?: AbortSignal) =>
     requestJson<DailyOverview>(`/daily/overview/${encodeURIComponent(date)}`, { signal }),
   meteringHistory: (userId: string, date: string, signal?: AbortSignal) =>
@@ -148,7 +151,13 @@ export const api = {
   meteringDiagnosis: (userId: string, date: string, signal?: AbortSignal) =>
     requestJson<MeteringDiagnosis>('/metering/diagnose', {
       method: 'POST',
-      body: JSON.stringify({ user_id: userId, diagnosis_date: date, save: false, deep_model: false }),
+      body: JSON.stringify({
+        user_id: userId,
+        diagnosis_date: date,
+        save: true,
+        deep_model: false,
+        create_work_order: false,
+      }),
       signal,
       timeoutMs: 90_000,
     }),
