@@ -5,9 +5,8 @@ import json
 import math
 import random
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 
 ROOT = Path(__file__).resolve().parent

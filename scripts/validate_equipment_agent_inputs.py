@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 INPUT_ROOT = ROOT / "agent_inputs" / "equipment_health"
 REPORT_PATH = ROOT / "reports" / "equipment_agent_input_validation.json"
 REQUIRED_CURRENT = {

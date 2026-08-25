@@ -8,7 +8,6 @@ from safety_operations.monitor import (
     NO_HELMET,
     UNKNOWN,
     Detection,
-    EventState,
     TrackState,
     add_helmet_observation,
     advance_event,

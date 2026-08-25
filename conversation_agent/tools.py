@@ -15,6 +15,9 @@ from langchain_core.messages import ToolMessage
 from langchain.tools import ToolRuntime, tool
 from langgraph.types import interrupt
 
+from rag.pipeline import RagConfig, RagConfigurationError, RagPipeline
+
+from .rag_support import rag_asset_url, resolve_rag_image
 from .sql_guard import DatabaseSource, ReadOnlyQueryExecutor, ReadOnlySQLRejected
 
 
@@ -162,8 +165,105 @@ def _query_artifacts(runtime: ToolRuntime) -> dict[str, dict[str, Any]]:
     return artifacts
 
 
+def _safe_markdown_alt(value: str) -> str:
+    """限制图片替代文字为单行，避免破坏工具提供的 Markdown。"""
+
+    return " ".join(value.replace("[", "（").replace("]", "）").split())[:180]
+
+
+def _rag_tool_result(root: Path, result: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """把检索结果拆成模型上下文和前端可追溯产物。"""
+
+    retrieval_id = f"rag_{uuid.uuid4().hex[:16]}"
+    passages: list[dict[str, Any]] = []
+    artifact_results: list[dict[str, Any]] = []
+    for index, item in enumerate(result.get("results") or [], start=1):
+        payload = dict(item.get("payload") or {})
+        source = str(payload.get("source") or "未知来源")
+        pages = list(payload.get("page_numbers") or [])
+        headings = [str(value) for value in payload.get("headings") or []]
+        text = str(payload.get("text") or payload.get("embed_text") or "").strip()
+        images: list[dict[str, Any]] = []
+        for raw_image in payload.get("images") or []:
+            if not isinstance(raw_image, dict):
+                continue
+            image_path = str(raw_image.get("image_path") or "").strip()
+            try:
+                # 只向模型提供当前服务器确实能够读取的安全图片地址。
+                resolve_rag_image(root, source, image_path)
+            except (ValueError, FileNotFoundError):
+                continue
+            image = dict(raw_image)
+            image["image_path"] = image_path
+            image["url"] = rag_asset_url(source, image_path)
+            alt = _safe_markdown_alt(
+                str(image.get("caption") or image.get("description") or f"{source} 资料图片")
+            )
+            image["markdown"] = f"![{alt}]({image['url']})"
+            images.append(image)
+
+        reference = f"资料{index}"
+        passages.append(
+            {
+                "reference": reference,
+                "source": source,
+                "page_numbers": pages,
+                "headings": headings,
+                "text": text,
+                "images": [
+                    {
+                        "page_no": image.get("page_no"),
+                        "image_type": image.get("image_type"),
+                        "description": image.get("description") or image.get("caption"),
+                        "markdown": image["markdown"],
+                    }
+                    for image in images
+                ],
+            }
+        )
+        artifact_results.append(
+            {
+                "reference": reference,
+                "point_id": item.get("point_id"),
+                "chunk_id": payload.get("chunk_id"),
+                "source": source,
+                "page_numbers": pages,
+                "headings": headings,
+                "text": text,
+                "rrf_score": item.get("rrf_score"),
+                "rerank_score": item.get("rerank_score"),
+                "dense": item.get("dense"),
+                "bm25": item.get("bm25"),
+                "images": images,
+            }
+        )
+
+    content = json.dumps(
+        {
+            "status": "ok",
+            "original_query": result.get("original_query"),
+            "passages": passages,
+            "instruction": (
+                "仅依据 passages 回答并使用 [资料N] 标注来源；"
+                "只有图片直接支持当前回答时，才把对应 markdown 原样放在引用段落之后。"
+            ),
+        },
+        ensure_ascii=False,
+    )
+    artifact = {
+        "type": "rag_retrieval",
+        "retrieval_id": retrieval_id,
+        "status": "ok",
+        "original_query": result.get("original_query"),
+        "collection": result.get("collection"),
+        "results": artifact_results,
+    }
+    return content, artifact
+
+
 def build_agent_tools(root: Path) -> list[Any]:
     executor = ReadOnlyQueryExecutor(root)
+    rag_pipeline = RagPipeline(RagConfig.from_env())
     result_database = root / "database" / "gas_ai_results.duckdb"
     initialize_work_order_schema(result_database)
 
@@ -209,6 +309,30 @@ def build_agent_tools(root: Path) -> list[Any]:
         """只读查询安防 SQLite。只能查询事件、复核、人员、通知和处置审计，不能改变事件状态。"""
 
         return _query_tool_result(executor, "security", sql)
+
+    @tool(response_format="content_and_artifact")
+    def search_technical_documents(query: str) -> tuple[str, dict[str, Any]]:
+        """检索技术标准、产品手册、传感器原理和设备技术要求；query 必须是补全上下文后的独立问题。"""
+
+        try:
+            result = rag_pipeline.search(query, hybrid_limit=20, top_n=5)
+        except (RagConfigurationError, RuntimeError):
+            retrieval_id = f"rag_{uuid.uuid4().hex[:16]}"
+            content = json.dumps(
+                {
+                    "status": "unavailable",
+                    "message": "技术知识库当前不可用，请明确告知用户本次未取得文档证据。",
+                },
+                ensure_ascii=False,
+            )
+            return content, {
+                "type": "rag_retrieval",
+                "retrieval_id": retrieval_id,
+                "status": "unavailable",
+                "original_query": query,
+                "results": [],
+            }
+        return _rag_tool_result(root, result)
 
     @tool
     def ask_user(
@@ -403,6 +527,7 @@ def build_agent_tools(root: Path) -> list[Any]:
         query_business_data,
         query_diagnosis_data,
         query_security_data,
+        search_technical_documents,
         ask_user,
         create_work_order,
         build_report_artifact,

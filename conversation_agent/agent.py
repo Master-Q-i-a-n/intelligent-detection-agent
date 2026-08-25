@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -25,11 +27,17 @@ from langchain_deepseek import ChatDeepSeek
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
+from pydantic import PrivateAttr
 
 from safety_operations.env import load_project_env
 
 from .schemas import ChatArtifact, ChatResumeRequest, ChatTurnResponse
 from .tools import build_agent_tools, build_query_error_middleware
+
+
+DEFAULT_CHAT_MODEL = "deepseek-v4-flash-vision-exp"
+_ATTACHMENT_ID_PATTERN = re.compile(r"^img_[0-9a-f]{32}$")
+_SUPPORTED_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
 
 SYSTEM_PROMPT = """
@@ -51,7 +59,67 @@ SYSTEM_PROMPT = """
 13. 不得向用户输出隐藏推理或 reasoning_content；执行进度只通过 Todo 和工具状态表达。
 14. 查询工具返回 SQL_QUERY_ERROR 且 retry_allowed=true 时，根据错误类别重写整条 SQL，最多修正一次；
     retry_allowed=false 时不得继续调用查询工具，应说明查询未完成，不得捏造结果。
+15. 标准、产品手册、传感器原理和技术要求先读取 technical-document-retrieval Skill，再按其规则调用 search_technical_documents；实时企业、诊断、安防和工单事实仍使用数据库查询工具。
+16. 知识库图片仅用于页面展示，不是视觉输入；用户直接上传的图片可以作为视觉输入，不清晰或无法辨认时必须明确说明。
 """.strip()
+
+
+class ReasoningAwareChatDeepSeek(ChatDeepSeek):
+    """补齐 DeepSeek 思考模式在 LangChain 中缺失的历史推理回传。"""
+
+    _attachment_root: Path | None = PrivateAttr(default=None)
+
+    def set_attachment_root(self, root: Path) -> None:
+        self._attachment_root = root.resolve()
+
+    def _get_request_payload(self, input_: Any, *, stop=None, **kwargs: Any) -> dict[str, Any]:
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        source_messages = self._convert_input(input_).to_messages()
+        request_messages = payload.get("messages")
+        if not isinstance(request_messages, list):
+            return payload
+
+        # DeepSeek 携带 tools 且开启思考时，所有历史助手消息都必须回传 reasoning_content。
+        for source, target in zip(source_messages, request_messages, strict=False):
+            if not isinstance(target, dict):
+                continue
+            if isinstance(source, AIMessage):
+                reasoning_content = source.additional_kwargs.get("reasoning_content")
+                if reasoning_content is not None:
+                    target["reasoning_content"] = reasoning_content
+                continue
+            if not isinstance(source, HumanMessage):
+                continue
+            attachments = source.additional_kwargs.get("image_attachments")
+            # additional_kwargs 只用于 checkpoint 保存轻量附件信息，不能原样发给服务商。
+            target.pop("image_attachments", None)
+            if not isinstance(attachments, list) or not attachments:
+                continue
+            if self._attachment_root is None:
+                raise ValueError("聊天图片存储目录尚未配置。")
+            content = target.get("content")
+            blocks: list[dict[str, Any]] = []
+            if isinstance(content, str) and content:
+                blocks.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                blocks.extend(item for item in content if isinstance(item, dict))
+            for attachment in attachments:
+                if not isinstance(attachment, dict):
+                    raise ValueError("聊天图片附件信息无效。")
+                attachment_id = str(attachment.get("id") or "")
+                mime_type = str(attachment.get("mime_type") or "")
+                if not _ATTACHMENT_ID_PATTERN.fullmatch(attachment_id) or mime_type not in _SUPPORTED_IMAGE_MIME_TYPES:
+                    raise ValueError("聊天图片附件格式无效。")
+                image_path = self._attachment_root / attachment_id
+                if not image_path.is_file():
+                    raise ValueError(f"聊天图片附件不存在：{attachment_id}")
+                encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+                blocks.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
+                })
+            target["content"] = blocks
+        return payload
 
 
 class ThreadedSqliteSaver(SqliteSaver):
@@ -129,6 +197,7 @@ def _artifact_from_tool_message(message: ToolMessage) -> ChatArtifact | None:
         "query_result",
         "report",
         "work_order",
+        "rag_retrieval",
     }:
         return None
     artifact_type = str(artifact["type"])
@@ -136,6 +205,7 @@ def _artifact_from_tool_message(message: ToolMessage) -> ChatArtifact | None:
         artifact.get("query_id")
         or artifact.get("report_id")
         or artifact.get("work_order_id")
+        or artifact.get("retrieval_id")
         or uuid_from_payload(artifact)
     )
     return ChatArtifact(type=artifact_type, id=artifact_id, payload=artifact)
@@ -161,6 +231,14 @@ def _artifact_progress(artifact: ChatArtifact | None) -> dict[str, Any] | None:
             "dataset_count": len(payload.get("datasets") or []),
             "chart_count": len(payload.get("charts") or []),
         }
+    if artifact.type == "rag_retrieval":
+        results = payload.get("results") or []
+        return {
+            "id": artifact.id,
+            "status": payload.get("status"),
+            "result_count": len(results),
+            "image_count": sum(len(item.get("images") or []) for item in results),
+        }
     return {"id": artifact.id, "status": payload.get("status")}
 
 
@@ -170,7 +248,7 @@ class ConversationAgentService:
     def __init__(self, root: Path):
         self.root = root
         load_project_env(root / ".env")
-        self.model_name = os.getenv("CHAT_LLM_MODEL") or os.getenv("LLM_MODEL", "deepseek-chat")
+        self.model_name = os.getenv("CHAT_LLM_MODEL") or DEFAULT_CHAT_MODEL
         self.base_url = (os.getenv("CHAT_LLM_BASE_URL") or os.getenv("LLM_BASE_URL", "https://api.deepseek.com")).rstrip("/")
         self.api_key = (
             os.getenv("CHAT_LLM_API_KEY")
@@ -179,6 +257,8 @@ class ConversationAgentService:
             or os.getenv("LLM_API_KEY")
         )
         self.provider = (os.getenv("CHAT_LLM_PROVIDER") or ("deepseek" if "deepseek" in self.base_url else "openai-compatible")).lower()
+        self.thinking_mode = os.getenv("CHAT_LLM_THINKING", "enabled").strip().lower()
+        self.reasoning_effort = os.getenv("CHAT_LLM_REASONING_EFFORT", "high").strip().lower()
         os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
         checkpoint_path = root / "database" / "user_data.db"
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,7 +297,7 @@ class ConversationAgentService:
     def _build_model(self):
         if not self.configured:
             raise RuntimeError("对话 Agent 未配置 API Key，请设置 CHAT_LLM_API_KEY 或 DEEPSEEK_API_KEY。")
-        common = {
+        common: dict[str, Any] = {
             "model": self.model_name,
             "api_key": self.api_key,
             "base_url": self.base_url,
@@ -227,7 +307,18 @@ class ConversationAgentService:
             "streaming": True,
         }
         if self.provider == "deepseek":
-            return ChatDeepSeek(**common)
+            if self.thinking_mode not in {"enabled", "disabled"}:
+                raise RuntimeError("CHAT_LLM_THINKING 仅支持 enabled 或 disabled。")
+            if self.reasoning_effort not in {"low", "high", "max"}:
+                raise RuntimeError("CHAT_LLM_REASONING_EFFORT 仅支持 low、high 或 max。")
+            common["extra_body"] = {"thinking": {"type": self.thinking_mode}}
+            if self.thinking_mode == "enabled":
+                # 思考模式下 temperature 不生效，不发送可避免产生误导配置。
+                common.pop("temperature", None)
+                common["reasoning_effort"] = self.reasoning_effort
+            model = ReasoningAwareChatDeepSeek(**common)
+            model.set_attachment_root(self.root / "database" / "chat_attachments")
+            return model
         # 非推理型 OpenAI 兼容模型可以走该分支；推理模型需另做兼容性验证。
         return ChatOpenAI(**common)
 
@@ -279,13 +370,26 @@ class ConversationAgentService:
             )
         return self._agent
 
-    def turn(self, user_id: str, thread_id: str, message: str) -> ChatTurnResponse:
+    @staticmethod
+    def _user_message(message: str, attachments: list[dict[str, str]] | None = None) -> HumanMessage:
+        attachments = attachments or []
+        model_text = message.strip() or ("请分析这些图片。" if attachments else "")
+        kwargs = {"image_attachments": attachments} if attachments else {}
+        return HumanMessage(content=model_text, additional_kwargs=kwargs)
+
+    def turn(
+        self,
+        user_id: str,
+        thread_id: str,
+        message: str,
+        attachments: list[dict[str, str]] | None = None,
+    ) -> ChatTurnResponse:
         agent = self._get_agent()
         scoped_thread_id = self._scoped_thread_id(user_id, thread_id)
         config = {"configurable": {"thread_id": scoped_thread_id}}
         with self._thread_lock(scoped_thread_id):
             output = agent.invoke(
-                {"messages": [{"role": "user", "content": message.strip()}]},
+                {"messages": [self._user_message(message, attachments)]},
                 config=config,
                 version="v2",
             )
@@ -321,13 +425,19 @@ class ConversationAgentService:
             raise ValueError("工单审批仅支持 approve、edit 或 reject。")
         return Command(resume={"decisions": [decision]})
 
-    async def stream_turn(self, user_id: str, thread_id: str, message: str) -> AsyncIterator[dict[str, Any]]:
+    async def stream_turn(
+        self,
+        user_id: str,
+        thread_id: str,
+        message: str,
+        attachments: list[dict[str, str]] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
         """流式执行一轮新消息；事件只暴露安全化进度，不包含隐藏推理。"""
 
         async for event in self._stream_agent(
             user_id,
             thread_id,
-            {"messages": [{"role": "user", "content": message.strip()}]},
+            {"messages": [self._user_message(message, attachments)]},
         ):
             yield event
 

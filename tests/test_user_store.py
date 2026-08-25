@@ -105,6 +105,54 @@ def test_failed_turn_keeps_question_but_allows_next_message(tmp_path):
     store.start_turn(user["user_id"], "chat_retry", "第二次查询")
 
 
+def test_chat_images_are_bound_to_message_restored_and_deleted_with_thread(tmp_path):
+    store = UserStore(tmp_path / "user_data.db")
+    user = store.register("image_user", "123456")
+    attachment = store.create_attachment(
+        user["user_id"],
+        "chat_images",
+        original_name="现场照片.png",
+        mime_type="image/png",
+        width=320,
+        height=180,
+        data=b"test-image-bytes",
+    )
+    image_path = store.attachment_root / attachment["id"]
+    assert image_path.is_file()
+
+    store.start_turn(user["user_id"], "chat_images", "", [attachment["id"]])
+    assert store.attachment_model_inputs(user["user_id"], "chat_images", [attachment["id"]]) == [
+        {"id": attachment["id"], "mime_type": "image/png"}
+    ]
+    detail = store.thread_detail(user["user_id"], "chat_images")
+    assert detail["thread"]["title"] == "图片分析"
+    assert detail["messages"][0]["content"] == ""
+    assert detail["messages"][0]["attachments"][0]["name"] == "现场照片.png"
+    assert not store.delete_pending_attachment(user["user_id"], attachment["id"])
+
+    assert store.delete_thread_records(user["user_id"], "chat_images")
+    assert not image_path.exists()
+
+
+def test_chat_image_cannot_be_bound_by_another_user(tmp_path):
+    store = UserStore(tmp_path / "user_data.db")
+    owner = store.register("image_owner", "123456")
+    other = store.register("image_other", "123456")
+    attachment = store.create_attachment(
+        owner["user_id"],
+        "chat_shared",
+        original_name="meter.webp",
+        mime_type="image/webp",
+        width=100,
+        height=100,
+        data=b"webp-placeholder",
+    )
+
+    with pytest.raises(PermissionError):
+        store.start_turn(other["user_id"], "chat_shared", "分析图片", [attachment["id"]])
+    assert store.delete_pending_attachment(owner["user_id"], attachment["id"])
+
+
 def test_sqlite_checkpoint_survives_connection_restart_and_can_be_deleted(tmp_path):
     database = tmp_path / "user_data.db"
     UserStore(database)

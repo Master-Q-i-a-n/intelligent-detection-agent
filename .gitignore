@@ -31,6 +31,7 @@ frontend/test-results/
 frontend/playwright-report/
 frontend/.vite/
 frontend/coverage/
+frontend/*.tsbuildinfo
 output/playwright/
 .playwright-cli/
 
@@ -53,13 +54,8 @@ logs/
 source_data/
 source_vibration/
 dataset/
-database/*.duckdb
-database/*.duckdb.wal
-database/*.db
-database/*.db-wal
-database/*.db-shm
-models/**/*.pt
-models/**/*.pth
+database/
+models/
 agent_inputs/
 
 # 安全作业运行资产与历史数据（代码和脱敏配置仍提交）
@@ -71,6 +67,8 @@ safety_operations/docs/
 
 # 运行和验证报告
 reports/
+output/
+web/
 
 # 编辑器和操作系统文件
 .idea/
@@ -79,7 +77,3 @@ reports/
 Thumbs.db
 Desktop.ini
 order.txt
-
-database/
-dataset/
-models/

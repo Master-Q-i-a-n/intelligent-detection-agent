@@ -101,10 +101,10 @@ npm --prefix frontend run build
 $env:GAS_SOURCE_ROOT='D:\path\to\gas-source-data'
 $env:GAS_VIBRATION_SOURCE_ROOT='D:\path\to\vibration-source-data'
 
-uv run python .\build_database.py --mode master
-uv run python .\build_database.py --mode scada --overwrite
-uv run python .\build_vibration_database.py --overwrite
-uv run python .\validate_vibration_database.py
+uv run python .\scripts\build_database.py --mode master
+uv run python .\scripts\build_database.py --mode scada --overwrite
+uv run python .\scripts\build_vibration_database.py --overwrite
+uv run python .\scripts\validate_vibration_database.py
 ```
 
 ## 功能模块
@@ -131,7 +131,7 @@ uv run python .\validate_vibration_database.py
 单用户命令行诊断：
 
 ```powershell
-uv run python .\metering_cli.py `
+uv run python .\scripts\metering_cli.py `
   --user-id 2267475 `
   --date 2025-01-12 `
   --output '.\reports\diagnosis_2267475_2025-01-12.json'
@@ -154,20 +154,20 @@ uv run python .\metering_cli.py `
 
 ```powershell
 # 训练
-uv run python .\equipment_cli.py train --epochs 20 --batch-size 256
+uv run python .\scripts\equipment_cli.py train --epochs 20 --batch-size 256
 
 # 单日诊断
-uv run python .\equipment_cli.py diagnose `
+uv run python .\scripts\equipment_cli.py diagnose `
   --user-id 1071586391 --date 2025-01-12
 
 # 趋势诊断
-uv run python .\equipment_cli.py trend `
+uv run python .\scripts\equipment_cli.py trend `
   --user-id 1071586391 --start 2024-12-25 --end 2025-01-12
 
 # 算法复验与 Agent 输入
-uv run python .\validate_equipment_algorithm.py
-uv run python .\equipment_cli.py export-agent-inputs
-uv run python .\validate_equipment_agent_inputs.py
+uv run python .\scripts\validate_equipment_algorithm.py
+uv run python .\scripts\equipment_cli.py export-agent-inputs
+uv run python .\scripts\validate_equipment_agent_inputs.py
 ```
 
 Agent 输入位于 `agent_inputs/equipment_health`。`index.json` 是用户索引，`users/<user_id>.json` 包含状态、阶段概率、健康指数、趋势、历史和处置建议，不包含三轴原始数组。首次验证可添加 `--limit-files 10`。
@@ -277,6 +277,45 @@ npm --prefix frontend run build
 npm --prefix frontend run test:e2e
 ```
 
+## RAG 技术文档检索
+
+RAG 已作为 `search_technical_documents` 工具接入多轮问答，也可以通过命令行独立验证。数据源默认读取：
+
+```text
+dataset/doc/用气体超声流量计测量天然气流量/ingest/records.json
+```
+
+运行前由用户自行配置以下环境变量：
+
+- `DASHSCOPE_API_KEY`、`DASHSCOPE_WORKSPACE_ID`：百炼 Embedding 与 Rerank。
+- 可选 `RAG_QDRANT_URL`、`RAG_COLLECTION_NAME`。
+
+启动本地 Qdrant，并将 203 条记录写入专用 Collection：
+
+```powershell
+.\scripts\start_qdrant.ps1
+uv run python -m rag.cli index --recreate
+```
+
+执行单条查询或两条固定示例：
+
+```powershell
+uv run python -m rag.cli query "超声流量计单向测量应如何安装？"
+uv run python -m rag.cli demo
+```
+
+运行 20 条人工标注检索评测，报告默认写入
+`output/rag_eval_results.json`：
+
+```powershell
+uv run --env-file .env python -m rag.evaluate
+```
+
+评测同时统计 RRF 混合召回与 qwen3-rerank 的 Recall@K、Hit@K、
+MRR@20、nDCG@K，并保留逐题 Top5 结果，便于定位漏召回。
+
+Agent 按技术文档检索 Skill 将当前问题和必要多轮上下文补全为可独立理解的问题。RAG 管线直接使用该问题执行“1024维向量相似度 + 中文 BM25 → RRF 融合 → qwen3-rerank”，不再额外调用 LLM 改写。Payload 中图片使用相对于文档目录的路径，例如 `images/fig_003/fig_003.png`，不保存机器绝对路径或图片二进制。
+
 ## 当前数据限制
 
 - 历史数据只有 19 天，正常用气预测属于短期稳健基线，不是长期季节性预测。
@@ -287,5 +326,5 @@ npm --prefix frontend run test:e2e
 
 ## 其他资料
 
-- 完整 DuckDB 查询示例：`query_examples.sql`
+- 完整 DuckDB 查询示例：`docs/query_examples.sql`
 - SCADA 未识别文件：`reports/failed_scada_files.csv`

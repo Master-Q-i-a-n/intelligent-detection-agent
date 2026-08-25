@@ -1,9 +1,9 @@
 [project]
 name = "intelligent-detection-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "燃气计量、设备健康与安全作业智能检测平台"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "duckdb==0.10.3",
     "fastapi>=0.115,<1",
@@ -16,6 +16,8 @@ dependencies = [
     "pyarrow==17.0.0",
     "pyyaml>=6,<7",
     "pydantic>=2.10,<3",
+    "python-multipart>=0.0.20,<1",
+    "qdrant-client>=1.18,<2",
     "scikit-learn==1.5.1",
     "torch==2.4.1",
     "ultralytics>=8.4.116",
@@ -26,6 +28,7 @@ dependencies = [
     "langchain-openai>=1.4.2",
     "sqlglot>=30.15.0",
     "langgraph-checkpoint-sqlite>=3.1.1",
+    "httpx>=0.28,<1",
 ]
 
 [dependency-groups]

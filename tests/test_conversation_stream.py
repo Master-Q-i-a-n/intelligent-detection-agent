@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from PIL import Image
 
-from conversation_agent.agent import ConversationAgentService
-from conversation_api import _sse_stream
+from conversation_agent.agent import ConversationAgentService, ReasoningAwareChatDeepSeek
+from conversation_api import _inspect_chat_image, _sse_stream
 
 
 class _FakeMessageStream:
@@ -120,6 +122,13 @@ def test_sse_transport_serializes_events_and_heartbeats_are_not_required():
     assert frames[-1].startswith("event: done\n")
 
 
+def test_uploaded_image_is_identified_from_its_content():
+    buffer = io.BytesIO()
+    Image.new("RGB", (16, 12), "white").save(buffer, format="PNG")
+
+    assert _inspect_chat_image(buffer.getvalue()) == ("image/png", 16, 12)
+
+
 def test_stream_interrupt_is_a_json_object(tmp_path: Path):
     async def collect():
         service = ConversationAgentService(tmp_path)
@@ -179,6 +188,94 @@ def test_hitl_resume_keeps_artifacts_from_original_turn(tmp_path: Path):
 
     assert response.status == "interrupted"
     assert [artifact.id for artifact in response.artifacts] == ["report-current"]
+
+
+def test_reasoning_content_is_written_back_for_tool_and_cross_turn_messages():
+    model = ReasoningAwareChatDeepSeek(
+        model="deepseek-v4-flash-vision-exp",
+        api_key="test-key",
+        base_url="https://api.deepseek.com",
+        extra_body={"thinking": {"type": "enabled"}},
+        reasoning_effort="high",
+    )
+    messages = [
+        HumanMessage(content="第一轮"),
+        AIMessage(
+            content="",
+            additional_kwargs={"reasoning_content": "同轮工具推理"},
+            tool_calls=[{"id": "call-1", "name": "search_technical_documents", "args": {"query": "测试"}}],
+        ),
+        ToolMessage(content="资料", tool_call_id="call-1"),
+        AIMessage(content="第一轮完成", additional_kwargs={"reasoning_content": "跨轮推理"}),
+        HumanMessage(content="继续"),
+    ]
+
+    payload = model._get_request_payload(messages)
+
+    assistant_messages = [item for item in payload["messages"] if item["role"] == "assistant"]
+    assert [item["reasoning_content"] for item in assistant_messages] == ["同轮工具推理", "跨轮推理"]
+
+
+def test_user_image_is_encoded_only_in_deepseek_request(tmp_path: Path):
+    attachment_id = "img_" + "a" * 32
+    attachment_root = tmp_path / "chat_attachments"
+    attachment_root.mkdir()
+    (attachment_root / attachment_id).write_bytes(b"fake-png-content")
+    model = ReasoningAwareChatDeepSeek(
+        model="deepseek-v4-flash-vision-exp",
+        api_key="test-key",
+        base_url="https://api.deepseek.com",
+    )
+    model.set_attachment_root(attachment_root)
+    user_message = HumanMessage(
+        content="识别表计读数",
+        additional_kwargs={"image_attachments": [{"id": attachment_id, "mime_type": "image/png"}]},
+    )
+
+    payload = model._get_request_payload([user_message])
+
+    assert user_message.content == "识别表计读数"
+    assert user_message.additional_kwargs["image_attachments"][0]["id"] == attachment_id
+    request_message = payload["messages"][0]
+    assert "image_attachments" not in request_message
+    assert request_message["content"][0] == {"type": "text", "text": "识别表计读数"}
+    assert request_message["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_conversation_model_defaults_to_vision_with_high_thinking(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("CHAT_LLM_MODEL", raising=False)
+    monkeypatch.setenv("CHAT_LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("CHAT_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("CHAT_LLM_BASE_URL", "https://api.deepseek.com")
+    monkeypatch.delenv("CHAT_LLM_THINKING", raising=False)
+    monkeypatch.delenv("CHAT_LLM_REASONING_EFFORT", raising=False)
+    service = ConversationAgentService(tmp_path)
+
+    model = service._build_model()
+
+    assert service.model_name == "deepseek-v4-flash-vision-exp"
+    assert isinstance(model, ReasoningAwareChatDeepSeek)
+    assert model.extra_body == {"thinking": {"type": "enabled"}}
+    assert model.reasoning_effort == "high"
+    assert model.temperature is None
+
+
+def test_rag_artifact_is_included_in_current_turn_response(tmp_path: Path):
+    service = ConversationAgentService(tmp_path)
+    rag_result = ToolMessage(
+        content="资料",
+        tool_call_id="rag-tool",
+        artifact={"type": "rag_retrieval", "retrieval_id": "rag-1", "status": "ok", "results": []},
+    )
+    state = {
+        "messages": [HumanMessage(content="查询标准"), rag_result, AIMessage(content="回答 [资料1]")],
+        "todos": [],
+    }
+
+    response = service._response_from_state(state, [])
+
+    assert [artifact.id for artifact in response.artifacts] == ["rag-1"]
+    assert response.artifacts[0].type == "rag_retrieval"
 
 
 async def _collect_frames(events):

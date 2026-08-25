@@ -4,10 +4,9 @@ import json
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 import duckdb  # noqa: E402
-import pandas as pd  # noqa: E402
 
 
 DB_PATH = ROOT / "database" / "gas_ai_input.duckdb"

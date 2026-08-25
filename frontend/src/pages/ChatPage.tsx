@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from 'react'
+import type { CSSProperties, ClipboardEvent as ReactClipboardEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from 'react'
 import ReactECharts from 'echarts-for-react'
 import type { EChartsOption } from 'echarts'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api } from '../api'
-import type { ChatArtifact, ChatArtifactType, ChatInterrupt, ChatStreamEvent, ChatThreadSummary, ChatTodo, ChatTurnResponse } from '../types'
+import type { ChatArtifact, ChatArtifactType, ChatAttachment, ChatInterrupt, ChatStreamEvent, ChatThreadSummary, ChatTodo, ChatTurnResponse } from '../types'
 
 interface DisplayMessage {
   id: string
@@ -13,7 +13,21 @@ interface DisplayMessage {
   content: string
   generator?: string
   artifactIds: string[]
+  attachments: ChatAttachment[]
 }
+
+interface PendingImage {
+  key: string
+  file: File
+  previewUrl: string
+}
+
+const MAX_IMAGES_PER_MESSAGE = 4
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024
+const MAX_IMAGE_TOTAL_BYTES = 24 * 1024 * 1024
+const SUPPORTED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'])
+
+type EvidenceArtifactType = Exclude<ChatArtifactType, 'rag_retrieval'>
 
 interface QueryPayload {
   type: 'query_result'
@@ -63,6 +77,12 @@ function isNarrowViewport(): boolean {
   return typeof window !== 'undefined' && typeof window.matchMedia === 'function'
     ? window.matchMedia('(max-width: 1050px)').matches
     : false
+}
+
+function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
+  // 只允许后端校验过的同源知识库图片，避免模型输出任意远程跟踪图片。
+  if (!src?.startsWith('/chat/rag-assets/')) return <span className="chat-markdown-image-blocked">[图片地址不可用]</span>
+  return <img src={src} alt={alt || '知识库资料图片'} loading="lazy" />
 }
 
 function asQueryPayload(artifact: ChatArtifact): QueryPayload | null {
@@ -235,11 +255,13 @@ export function ChatPage() {
   const [messages, setMessages] = useState<DisplayMessage[]>([{
     id: 'welcome', role: 'assistant',
     content: '可以查询用气、智能计量、智能设备和安全作业数据，也可以生成带图报告或在确认后创建工单。',
-    artifactIds: [],
+    artifactIds: [], attachments: [],
   }])
   const [artifacts, setArtifacts] = useState<Record<string, ChatArtifact>>({})
   const [interruptState, setInterruptState] = useState<ChatInterrupt | null>(null)
   const [input, setInput] = useState('')
+  const [pendingImages, setPendingImages] = useState<PendingImage[]>([])
+  const [uploading, setUploading] = useState(false)
   const [resumeText, setResumeText] = useState('')
   const [editText, setEditText] = useState('')
   const [busy, setBusy] = useState(false)
@@ -249,7 +271,7 @@ export function ChatPage() {
   const [todos, setTodos] = useState<ChatTodo[]>([])
   const [todoOpen, setTodoOpen] = useState(false)
   const [panelOpen, setPanelOpen] = useState(false)
-  const [artifactView, setArtifactView] = useState<ChatArtifactType>('report')
+  const [artifactView, setArtifactView] = useState<EvidenceArtifactType>('report')
   const [selectedArtifactIds, setSelectedArtifactIds] = useState<string[]>([])
   const [narrowPanel, setNarrowPanel] = useState(isNarrowViewport)
   const [splitPercent, setSplitPercent] = useState(44)
@@ -259,6 +281,8 @@ export function ChatPage() {
   const [historyError, setHistoryError] = useState('')
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null)
   const controllerRef = useRef<AbortController | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const pendingImagesRef = useRef<PendingImage[]>([])
   const messageEndRef = useRef<HTMLDivElement | null>(null)
   const workspaceRef = useRef<HTMLDivElement | null>(null)
   const panelRef = useRef<HTMLElement | null>(null)
@@ -295,7 +319,12 @@ export function ChatPage() {
   useEffect(() => () => {
     controllerRef.current?.abort()
     if (deltaTimerRef.current !== null) window.clearTimeout(deltaTimerRef.current)
+    pendingImagesRef.current.forEach((image) => URL.revokeObjectURL(image.previewUrl))
   }, [])
+
+  useEffect(() => {
+    pendingImagesRef.current = pendingImages
+  }, [pendingImages])
 
   useEffect(() => {
     if (typeof messageEndRef.current?.scrollIntoView === 'function') {
@@ -378,7 +407,7 @@ export function ChatPage() {
     if (response.message) {
       setMessages((current) => [...current, {
         id: crypto.randomUUID(), role: 'assistant', content: response.message,
-        generator: response.generator, artifactIds,
+        generator: response.generator, artifactIds, attachments: [],
       }])
     }
     if (hasNewReport) {
@@ -428,6 +457,7 @@ export function ChatPage() {
         content: message.content,
         generator: message.generator || undefined,
         artifactIds: message.artifact_ids || [],
+        attachments: message.attachments || [],
       })))
       setArtifacts(Object.fromEntries(detail.artifacts.map((artifact) => [artifact.id, artifact])))
       setTodos(detail.todos || [])
@@ -442,6 +472,7 @@ export function ChatPage() {
       }
       setResumeText('')
       setInput('')
+      clearPendingImages()
       setError(detail.last_error || '')
       setPanelOpen(false)
       setSelectedArtifactIds([])
@@ -528,11 +559,88 @@ export function ChatPage() {
 
   async function sendMessage() {
     const message = input.trim()
-    if (!message || busy || interruptState) return
-    setInput('')
+    const images = pendingImages
+    if ((!message && !images.length) || busy || uploading || interruptState) return
+    setUploading(true)
     setError('')
-    setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'user', content: message, artifactIds: [] }])
-    await runStream((onEvent, signal) => api.chatTurnStream(threadId, message, onEvent, signal))
+    const uploaded: ChatAttachment[] = []
+    try {
+      // 顺序上传便于在中途失败时准确清理已经成功的临时附件。
+      for (const image of images) {
+        uploaded.push(await api.uploadChatAttachment(threadId, image.file))
+      }
+    } catch (reason) {
+      await Promise.all(uploaded.map((attachment) => api.deleteChatAttachment(attachment.id).catch(() => undefined)))
+      setError(reason instanceof Error ? reason.message : '图片上传失败')
+      setUploading(false)
+      return
+    }
+    setInput('')
+    clearPendingImages()
+    setMessages((current) => [...current, {
+      id: crypto.randomUUID(), role: 'user', content: message, artifactIds: [], attachments: uploaded,
+    }])
+    setUploading(false)
+    await runStream((onEvent, signal) => api.chatTurnStream(
+      threadId, message, uploaded.map((attachment) => attachment.id), onEvent, signal,
+    ))
+  }
+
+  function addPendingImages(files: File[]) {
+    if (!files.length) return
+    const current = pendingImagesRef.current
+    if (files.some((file) => !SUPPORTED_IMAGE_TYPES.has(file.type))) {
+      setError('仅支持 JPEG、PNG 和 WebP 图片。')
+      return
+    }
+    if (files.some((file) => file.size > MAX_IMAGE_BYTES)) {
+      setError('单张图片不能超过 8 MiB。')
+      return
+    }
+    if (current.length + files.length > MAX_IMAGES_PER_MESSAGE) {
+      setError(`每条消息最多上传 ${MAX_IMAGES_PER_MESSAGE} 张图片。`)
+      return
+    }
+    const totalBytes = current.reduce((sum, image) => sum + image.file.size, 0)
+      + files.reduce((sum, file) => sum + file.size, 0)
+    if (totalBytes > MAX_IMAGE_TOTAL_BYTES) {
+      setError('每条消息的图片总大小不能超过 24 MiB。')
+      return
+    }
+    const next = [...current, ...files.map((file) => ({
+      key: crypto.randomUUID(), file, previewUrl: URL.createObjectURL(file),
+    }))]
+    pendingImagesRef.current = next
+    setPendingImages(next)
+    setError('')
+  }
+
+  function handleImagePaste(event: ReactClipboardEvent<HTMLTextAreaElement>) {
+    const itemFiles = Array.from(event.clipboardData.items)
+      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null)
+    const files = itemFiles.length
+      ? itemFiles
+      : Array.from(event.clipboardData.files).filter((file) => file.type.startsWith('image/'))
+    // 保留浏览器默认粘贴，因此剪贴板同时含文字和图片时，文字仍会进入输入框。
+    addPendingImages(files)
+  }
+
+  function removePendingImage(key: string) {
+    const current = pendingImagesRef.current
+    const removed = current.find((image) => image.key === key)
+    if (removed) URL.revokeObjectURL(removed.previewUrl)
+    const next = current.filter((image) => image.key !== key)
+    pendingImagesRef.current = next
+    setPendingImages(next)
+  }
+
+  function clearPendingImages() {
+    pendingImagesRef.current.forEach((image) => URL.revokeObjectURL(image.previewUrl))
+    pendingImagesRef.current = []
+    setPendingImages([])
+    if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
   async function resume(decision: 'answer' | 'approve' | 'edit' | 'reject') {
@@ -546,7 +654,7 @@ export function ChatPage() {
         editedAction = { name: 'create_work_order', args }
       }
       if (decision === 'answer' && resumeText.trim()) {
-        setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'user', content: resumeText.trim(), artifactIds: [] }])
+        setMessages((current) => [...current, { id: crypto.randomUUID(), role: 'user', content: resumeText.trim(), artifactIds: [], attachments: [] }])
       }
       // 用户提交后立即收起确认卡；如果网络或后端失败，再恢复原卡片供重试。
       setInterruptState(null)
@@ -573,10 +681,11 @@ export function ChatPage() {
   function resetConversation() {
     controllerRef.current?.abort()
     setThreadId(newThreadId())
-    setMessages([{ id: 'welcome', role: 'assistant', content: '已开始新的对话。请告诉我需要查询的对象、时间或报告主题。', artifactIds: [] }])
+    setMessages([{ id: 'welcome', role: 'assistant', content: '已开始新的对话。请告诉我需要查询的对象、时间或报告主题。', artifactIds: [], attachments: [] }])
     setArtifacts({})
     setInterruptState(null)
     setInput('')
+    clearPendingImages()
     setError('')
     setBusy(false)
     setTodos([])
@@ -590,7 +699,7 @@ export function ChatPage() {
     setDeleteConfirmId(null)
   }
 
-  function openArtifactPanel(message: DisplayMessage, type: ChatArtifactType, trigger: HTMLButtonElement) {
+  function openArtifactPanel(message: DisplayMessage, type: EvidenceArtifactType, trigger: HTMLButtonElement) {
     artifactTriggerRef.current = trigger
     setSelectedArtifactIds(message.artifactIds)
     setArtifactView(type)
@@ -634,7 +743,7 @@ export function ChatPage() {
   const reports = selectedArtifacts.map(asReportPayload).filter((item): item is ReportPayload => item !== null)
   const queries = selectedArtifacts.map(asQueryPayload).filter((item): item is QueryPayload => item !== null)
   const workOrders = selectedArtifacts.filter((item) => item.type === 'work_order')
-  const panelCounts: Record<ChatArtifactType, number> = {
+  const panelCounts: Record<EvidenceArtifactType, number> = {
     report: reports.length,
     query_result: queries.length,
     work_order: workOrders.length,
@@ -676,7 +785,7 @@ export function ChatPage() {
         <div className="chat-messages" aria-live="polite">
           {messages.map((message) => {
             const messageArtifacts = message.artifactIds.map((id) => artifacts[id]).filter((artifact): artifact is ChatArtifact => !!artifact)
-            const counts: Record<ChatArtifactType, number> = {
+            const counts: Record<EvidenceArtifactType, number> = {
               report: messageArtifacts.filter((artifact) => artifact.type === 'report').length,
               query_result: messageArtifacts.filter((artifact) => artifact.type === 'query_result').length,
               work_order: messageArtifacts.filter((artifact) => artifact.type === 'work_order').length,
@@ -685,9 +794,10 @@ export function ChatPage() {
               <span>{message.role === 'assistant' ? 'YH' : 'YOU'}</span>
               <div className="chat-message-bubble">
                 <small>{message.role === 'assistant' ? '智能助手' : '当前用户'}</small>
-                {message.role === 'assistant' ? <div className="chat-message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown></div> : <p>{message.content}</p>}
+                {!!message.attachments.length && <div className="chat-message-images">{message.attachments.map((attachment) => <img key={attachment.id} src={attachment.preview_url} alt={attachment.name} loading="lazy" />)}</div>}
+                {message.role === 'assistant' ? <div className="chat-message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ img: MarkdownImage }}>{message.content}</ReactMarkdown></div> : message.content ? <p>{message.content}</p> : null}
                 {message.generator && <em>{generatorLabel(message.generator)}</em>}
-                {message.role === 'assistant' && messageArtifacts.length > 0 && <div className="chat-artifact-actions" aria-label="本轮结构化产物">
+                {message.role === 'assistant' && Object.values(counts).some((count) => count > 0) && <div className="chat-artifact-actions" aria-label="本轮结构化产物">
                   {counts.report > 0 && <button type="button" onClick={(event) => openArtifactPanel(message, 'report', event.currentTarget)}>查看报告（{counts.report}）</button>}
                   {counts.query_result > 0 && <button type="button" onClick={(event) => openArtifactPanel(message, 'query_result', event.currentTarget)}>查看 SQL 查询（{counts.query_result}）</button>}
                   {counts.work_order > 0 && <button type="button" onClick={(event) => openArtifactPanel(message, 'work_order', event.currentTarget)}>查看工单（{counts.work_order}）</button>}
@@ -723,18 +833,28 @@ export function ChatPage() {
           {todoOpen && <ol>{todos.map((todo, index) => <li className={todo.status} key={`${index}-${todo.content}`}><span>{todo.status === 'completed' ? '✓' : todo.status === 'in_progress' ? '→' : '·'}</span><p>{todo.content}</p></li>)}</ol>}
         </section>}
         <footer className="chat-composer">
-          <textarea
-            aria-label="对话输入"
-            value={input}
-            disabled={busy || !!interruptState}
-            placeholder={interruptState ? '请先处理上方确认卡片' : '例如：2025年1月12日用气量超过1000立方米的用户有哪些？'}
-            onChange={(event) => setInput(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage() }
-            }}
-          />
-          {busy ? <button className="button button-danger" type="button" onClick={stopStream}>停止等待</button> : <button className="button button-primary" type="button" disabled={!input.trim() || !!interruptState} onClick={() => void sendMessage()}>发送</button>}
-          <small>Enter 发送 · Shift+Enter 换行</small>
+          {!!pendingImages.length && <div className="chat-image-preview-list" aria-label="待发送图片">{pendingImages.map((image) => <figure key={image.key}>
+            <img src={image.previewUrl} alt={image.file.name} />
+            <figcaption title={image.file.name}>{image.file.name}</figcaption>
+            <button type="button" aria-label={`移除图片 ${image.file.name}`} onClick={() => removePendingImage(image.key)}>×</button>
+          </figure>)}</div>}
+          <div className="chat-composer-editor">
+            <textarea
+              aria-label="对话输入"
+              value={input}
+              disabled={busy || uploading || !!interruptState}
+              placeholder={interruptState ? '请先处理上方确认卡片' : '输入问题，也可以选择或直接粘贴图片…'}
+              onChange={(event) => setInput(event.target.value)}
+              onPaste={handleImagePaste}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage() }
+              }}
+            />
+            <button className="chat-image-picker" type="button" disabled={busy || uploading || !!interruptState || pendingImages.length >= MAX_IMAGES_PER_MESSAGE} onClick={() => fileInputRef.current?.click()}>＋ 添加图片</button>
+            <input ref={fileInputRef} className="chat-image-file-input" type="file" accept="image/jpeg,image/png,image/webp" multiple onChange={(event) => { addPendingImages(Array.from(event.target.files || [])); event.target.value = '' }} />
+          </div>
+          {busy ? <button className="button button-danger" type="button" onClick={stopStream}>停止等待</button> : <button className="button button-primary" type="button" disabled={uploading || (!input.trim() && !pendingImages.length) || !!interruptState} onClick={() => void sendMessage()}>{uploading ? '上传中…' : '发送'}</button>}
+          <small>Enter 发送 · Shift+Enter 换行 · 支持 Ctrl+V 粘贴图片</small>
         </footer>
       </section>
 

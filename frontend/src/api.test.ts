@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { requestSse } from './api'
+import { api, requestSse } from './api'
 import type { ChatStreamEvent } from './types'
 
 afterEach(() => vi.restoreAllMocks())
@@ -30,5 +30,23 @@ describe('SSE 客户端', () => {
       headers: { 'Content-Type': 'application/json' },
     }))
     await expect(requestSse('/chat/turns/stream', { onEvent: () => undefined })).rejects.toMatchObject({ status: 503, message: '未配置', name: 'ApiError' })
+  })
+})
+
+describe('聊天图片上传', () => {
+  it('使用 multipart FormData 且不强制设置 JSON Content-Type', async () => {
+    const response = {
+      id: 'img_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', name: 'meter.png', mime_type: 'image/png',
+      size_bytes: 3, width: 10, height: 10, preview_url: '/chat/attachments/img_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(response), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+
+    await api.uploadChatAttachment('chat_image_test', new File(['png'], 'meter.png', { type: 'image/png' }))
+
+    const options = fetchMock.mock.calls[0][1]
+    expect(options?.body).toBeInstanceOf(FormData)
+    expect(new Headers(options?.headers).has('Content-Type')).toBe(false)
   })
 })

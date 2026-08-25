@@ -14,11 +14,13 @@ vi.mock('../api', () => ({
     chatThreads: vi.fn(),
     chatThread: vi.fn(),
     deleteChatThread: vi.fn(),
+    uploadChatAttachment: vi.fn(),
+    deleteChatAttachment: vi.fn(),
   },
 }))
 
 function streamResponse(response: ChatTurnResponse) {
-  return async (_threadId: string, _message: string, onEvent: (event: ChatStreamEvent) => void) => {
+  return async (_threadId: string, _message: string, _attachmentIds: string[], onEvent: (event: ChatStreamEvent) => void) => {
     onEvent({ event: 'meta', data: { run_id: 'run_test', thread_id: 'thread_test' } })
     response.artifacts.forEach((artifact) => onEvent({ event: 'artifact', data: artifact as unknown as Record<string, unknown> }))
     onEvent({ event: 'done', data: response as unknown as Record<string, unknown> })
@@ -38,6 +40,35 @@ beforeEach(() => {
 })
 
 describe('智能问答页面', () => {
+  it('支持直接粘贴图片并在没有文字时发送', async () => {
+    const file = new File(['png-content'], '现场表计.png', { type: 'image/png' })
+    vi.mocked(api.uploadChatAttachment).mockResolvedValue({
+      id: 'img_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      name: file.name,
+      mime_type: 'image/png',
+      size_bytes: file.size,
+      width: 320,
+      height: 180,
+      preview_url: '/chat/attachments/img_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    })
+    vi.mocked(api.chatTurnStream).mockImplementation(streamResponse({
+      status: 'completed', message: '图片中的表计读数为 123。', generator: 'test', artifacts: [],
+    }))
+    render(<ChatPage />)
+    const input = screen.getByRole('textbox', { name: '对话输入' })
+
+    fireEvent.paste(input, { clipboardData: { items: [{ kind: 'file', type: 'image/png', getAsFile: () => file }] } })
+    expect(screen.getByRole('img', { name: file.name })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+
+    await waitFor(() => expect(api.uploadChatAttachment).toHaveBeenCalledWith(expect.any(String), file))
+    await waitFor(() => expect(api.chatTurnStream).toHaveBeenCalledWith(
+      expect.any(String), '', ['img_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], expect.any(Function), expect.any(AbortSignal),
+    ))
+    expect(await screen.findByText('图片中的表计读数为 123。')).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: file.name })).toHaveAttribute('src', '/chat/attachments/img_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+  })
+
   it('可以恢复并永久删除当前用户的历史对话', async () => {
     vi.mocked(api.chatThreads).mockResolvedValue({ items: [{
       thread_id: 'chat_history', title: '一月用气分析', created_at: '2025-01-01T08:00:00Z',
@@ -46,8 +77,8 @@ describe('智能问答页面', () => {
     vi.mocked(api.chatThread).mockResolvedValue({
       thread: { thread_id: 'chat_history', title: '一月用气分析', created_at: '2025-01-01T08:00:00Z', updated_at: '2025-01-02T09:30:00Z' },
       messages: [
-        { id: 'm1', role: 'user', content: '分析一月用气', artifact_ids: [], created_at: '2025-01-01T08:00:00Z' },
-        { id: 'm2', role: 'assistant', content: '历史分析已完成。', generator: 'test', artifact_ids: ['q-history'], created_at: '2025-01-01T08:00:05Z' },
+        { id: 'm1', role: 'user', content: '分析一月用气', artifact_ids: [], attachments: [], created_at: '2025-01-01T08:00:00Z' },
+        { id: 'm2', role: 'assistant', content: '历史分析已完成。', generator: 'test', artifact_ids: ['q-history'], attachments: [], created_at: '2025-01-01T08:00:05Z' },
       ],
       artifacts: [{ type: 'query_result', id: 'q-history', payload: { type: 'query_result', query_id: 'q-history', source: 'business', sql: 'SELECT 1', columns: [], rows: [], row_count: 0, truncated: false, elapsed_ms: 1 } }],
       todos: [], interrupt: null, last_error: null,
@@ -149,7 +180,7 @@ describe('智能问答页面', () => {
   })
 
   it('保留 Todo，但不展示工具执行流水和相关按钮', async () => {
-    vi.mocked(api.chatTurnStream).mockImplementation(async (_threadId, _message, onEvent) => {
+    vi.mocked(api.chatTurnStream).mockImplementation(async (_threadId, _message, _attachmentIds, onEvent) => {
       onEvent({ event: 'todo', data: { items: [{ content: '查询每日用气', status: 'in_progress' }] } })
       onEvent({ event: 'tool_start', data: { tool_call_id: 't1', name: 'query_business_data' } })
       onEvent({ event: 'tool_end', data: { tool_call_id: 't1', name: 'query_business_data', status: 'success', elapsed_ms: 12, result: { query_id: 'q1', row_count: 3 } } })
@@ -179,6 +210,37 @@ describe('智能问答页面', () => {
     expect(screen.getByRole('button', { name: '查看报告（1）' })).toBeInTheDocument()
     expect(screen.queryByText('## 二级标题')).not.toBeInTheDocument()
     expect(document.querySelector('script')).toBeNull()
+  })
+
+  it('在资料引用段落后渲染受控 RAG 图片且不生成空产物按钮', async () => {
+    const imageUrl = '/chat/rag-assets/%E5%8E%8B%E5%8A%9B%E4%BC%A0%E6%84%9F%E5%99%A8.pdf/images/fig_001/fig_001.png'
+    const response: ChatTurnResponse = {
+      status: 'completed',
+      message: `安装时应避免脉动和过热。[资料1]\n\n![压力变送器安装示意图](${imageUrl})`,
+      generator: 'deepagents:deepseek:deepseek-v4-flash-vision-exp',
+      artifacts: [{ type: 'rag_retrieval', id: 'rag-1', payload: { type: 'rag_retrieval', retrieval_id: 'rag-1', results: [] } }],
+    }
+    vi.mocked(api.chatTurnStream).mockImplementation(streamResponse(response))
+    render(<ChatPage />)
+    fireEvent.change(screen.getByRole('textbox', { name: '对话输入' }), { target: { value: '如何安装压力传感器？' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+
+    const image = await screen.findByRole('img', { name: '压力变送器安装示意图' })
+    expect(image).toHaveAttribute('src', imageUrl)
+    expect(image).toHaveAttribute('loading', 'lazy')
+    expect(screen.queryByLabelText('本轮结构化产物')).not.toBeInTheDocument()
+  })
+
+  it('阻止模型回答中的外部 Markdown 图片', async () => {
+    vi.mocked(api.chatTurnStream).mockImplementation(streamResponse({
+      status: 'completed', message: '![外部图片](https://example.com/tracker.png)', generator: 'test', artifacts: [],
+    }))
+    render(<ChatPage />)
+    fireEvent.change(screen.getByRole('textbox', { name: '对话输入' }), { target: { value: '测试图片' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+
+    expect(await screen.findByText('[图片地址不可用]')).toBeInTheDocument()
+    expect(screen.queryByRole('img', { name: '外部图片' })).not.toBeInTheDocument()
   })
 
   it('报告面板打开后分隔条支持键盘调整', async () => {
@@ -237,7 +299,7 @@ describe('智能问答页面', () => {
 
   it('流式回答期间显示三个依次跳动的状态点', async () => {
     let finish: (() => void) | undefined
-    vi.mocked(api.chatTurnStream).mockImplementation(async (_threadId, _message, onEvent) => new Promise<void>((resolve) => {
+    vi.mocked(api.chatTurnStream).mockImplementation(async (_threadId, _message, _attachmentIds, onEvent) => new Promise<void>((resolve) => {
       finish = () => {
         onEvent({ event: 'done', data: { status: 'completed', message: '回答完成。', generator: 'deepagents:deepseek:deepseek-v4-flash', artifacts: [] } })
         resolve()

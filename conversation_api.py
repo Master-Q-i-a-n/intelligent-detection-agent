@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import warnings
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
+from PIL import Image, UnidentifiedImageError
 
 from conversation_agent import ConversationAgentService
+from conversation_agent.rag_support import resolve_rag_image
 from conversation_agent.schemas import ChatResumeRequest, ChatTurnRequest, ChatTurnResponse
 from user_store import UserStore
+
+
+MAX_CHAT_IMAGE_BYTES = 8 * 1024 * 1024
+SUPPORTED_CHAT_IMAGE_FORMATS = {
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "WEBP": "image/webp",
+}
 
 
 def _encode_sse(event: dict[str, Any]) -> str:
@@ -52,6 +64,27 @@ def _current_user(request: Request) -> dict[str, str]:
     return user
 
 
+def _inspect_chat_image(data: bytes) -> tuple[str, int, int]:
+    """按真实文件内容识别图片，避免只信任浏览器传来的扩展名和 MIME。"""
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as image:
+                image.verify()
+            with Image.open(io.BytesIO(data)) as image:
+                image_format = str(image.format or "").upper()
+                width, height = image.size
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise ValueError("图片文件已损坏、无法识别或尺寸异常。") from exc
+    mime_type = SUPPORTED_CHAT_IMAGE_FORMATS.get(image_format)
+    if mime_type is None:
+        raise ValueError("仅支持 JPEG、PNG 和 WebP 图片。")
+    if width <= 0 or height <= 0:
+        raise ValueError("图片尺寸无效。")
+    return mime_type, width, height
+
+
 def create_conversation_router(root: Path, store: UserStore) -> APIRouter:
     """延迟初始化大模型，避免未配置对话密钥时影响原有检测接口。"""
 
@@ -71,6 +104,63 @@ def create_conversation_router(root: Path, store: UserStore) -> APIRouter:
             "memory": "sqlite-user-thread",
             "tracing_enabled": service.tracing_enabled,
         }
+
+    @router.get("/rag-assets/{source}/{image_path:path}")
+    def rag_asset(source: str, image_path: str):
+        """只读取已入库文档目录中的图片，供回答 Markdown 同源展示。"""
+
+        try:
+            path = resolve_rag_image(root, source, image_path)
+        except ValueError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return FileResponse(path)
+
+    @router.post("/attachments")
+    async def upload_attachment(
+        http_request: Request,
+        thread_id: str = Form(min_length=8, max_length=80, pattern=r"^[A-Za-z0-9_-]+$"),
+        file: UploadFile = File(...),
+    ):
+        user = _current_user(http_request)
+        data = await file.read(MAX_CHAT_IMAGE_BYTES + 1)
+        await file.close()
+        if not data:
+            raise HTTPException(status_code=400, detail="图片文件为空。")
+        if len(data) > MAX_CHAT_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail="单张图片不能超过 8 MiB。")
+        try:
+            mime_type, width, height = _inspect_chat_image(data)
+            return store.create_attachment(
+                user["user_id"],
+                thread_id,
+                original_name=Path(file.filename or "image").name,
+                mime_type=mime_type,
+                width=width,
+                height=height,
+                data=data,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=404, detail="对话不存在。") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.get("/attachments/{attachment_id}")
+    def attachment_file(attachment_id: str, http_request: Request):
+        user = _current_user(http_request)
+        resolved = store.attachment_file(user["user_id"], attachment_id)
+        if resolved is None:
+            raise HTTPException(status_code=404, detail="图片不存在。")
+        path, mime_type = resolved
+        return FileResponse(path, media_type=mime_type, headers={"Cache-Control": "private, max-age=3600"})
+
+    @router.delete("/attachments/{attachment_id}", status_code=204)
+    def delete_attachment(attachment_id: str, http_request: Request) -> Response:
+        user = _current_user(http_request)
+        if not store.delete_pending_attachment(user["user_id"], attachment_id):
+            raise HTTPException(status_code=404, detail="待发送图片不存在。")
+        return Response(status_code=204)
 
     @router.get("/threads")
     def list_threads(http_request: Request):
@@ -98,8 +188,15 @@ def create_conversation_router(root: Path, store: UserStore) -> APIRouter:
     def create_turn(request: ChatTurnRequest, http_request: Request):
         user = _current_user(http_request)
         try:
-            store.start_turn(user["user_id"], request.thread_id, request.message.strip())
-            response = service.turn(user["user_id"], request.thread_id, request.message)
+            store.start_turn(
+                user["user_id"], request.thread_id, request.message.strip(), request.attachment_ids
+            )
+            attachments = store.attachment_model_inputs(
+                user["user_id"], request.thread_id, request.attachment_ids
+            )
+            response = service.turn(
+                user["user_id"], request.thread_id, request.message, attachments
+            )
             store.record_response(user["user_id"], request.thread_id, response.model_dump(mode="json"))
             return response
         except PermissionError as exc:
@@ -168,14 +265,21 @@ def create_conversation_router(root: Path, store: UserStore) -> APIRouter:
             raise HTTPException(status_code=503, detail="对话 Agent 未配置 API Key。")
         user = _current_user(http_request)
         try:
-            store.start_turn(user["user_id"], request.thread_id, request.message.strip())
+            store.start_turn(
+                user["user_id"], request.thread_id, request.message.strip(), request.attachment_ids
+            )
+            attachments = store.attachment_model_inputs(
+                user["user_id"], request.thread_id, request.attachment_ids
+            )
         except PermissionError as exc:
             raise HTTPException(status_code=404, detail="对话不存在。") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return StreamingResponse(
             _sse_stream(persisted_stream(
-                service.stream_turn(user["user_id"], request.thread_id, request.message),
+                service.stream_turn(
+                    user["user_id"], request.thread_id, request.message, attachments
+                ),
                 user["user_id"], request.thread_id,
             )),
             media_type="text/event-stream",

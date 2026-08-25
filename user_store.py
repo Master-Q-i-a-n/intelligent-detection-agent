@@ -15,6 +15,9 @@ from typing import Any
 
 SESSION_DAYS = 7
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fff]{3,32}$")
+MAX_CHAT_IMAGES = 4
+MAX_CHAT_IMAGE_TOTAL_BYTES = 24 * 1024 * 1024
+PENDING_ATTACHMENT_HOURS = 24
 
 
 def _now() -> datetime:
@@ -40,9 +43,12 @@ class UserStore:
 
     def __init__(self, path: Path):
         self.path = path
+        self.attachment_root = self.path.parent / "chat_attachments"
         self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.attachment_root.mkdir(parents=True, exist_ok=True)
         self._initialize()
+        self.cleanup_stale_attachments()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.path), timeout=10)
@@ -103,6 +109,23 @@ class UserStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_chat_messages_thread_sequence
                     ON chat_messages(thread_id, sequence);
+
+                CREATE TABLE IF NOT EXISTS chat_attachments (
+                    attachment_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                    thread_id TEXT NOT NULL,
+                    message_id TEXT REFERENCES chat_messages(message_id) ON DELETE CASCADE,
+                    original_name TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_attachments_message
+                    ON chat_attachments(message_id);
+                CREATE INDEX IF NOT EXISTS idx_chat_attachments_pending
+                    ON chat_attachments(created_at) WHERE message_id IS NULL;
 
                 CREATE TABLE IF NOT EXISTS chat_artifacts (
                     artifact_id TEXT PRIMARY KEY,
@@ -242,9 +265,127 @@ class UserStore:
         ).fetchone()
         return int(row[0])
 
-    def start_turn(self, user_id: str, thread_id: str, message: str) -> str:
+    def create_attachment(
+        self,
+        user_id: str,
+        thread_id: str,
+        *,
+        original_name: str,
+        mime_type: str,
+        width: int,
+        height: int,
+        data: bytes,
+    ) -> dict[str, Any]:
+        """保存尚未发送的聊天图片；发送消息时再原子绑定到用户消息。"""
+
+        self.cleanup_stale_attachments()
+        attachment_id = f"img_{uuid.uuid4().hex}"
+        target = self.attachment_root / attachment_id
+        now = _timestamp()
+        with self._lock, self.connect() as connection:
+            thread = connection.execute(
+                "SELECT user_id FROM chat_threads WHERE thread_id=?", (thread_id,)
+            ).fetchone()
+            if thread and thread["user_id"] != user_id:
+                raise PermissionError("无权向该对话上传附件。")
+            target.write_bytes(data)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO chat_attachments
+                    (attachment_id,user_id,thread_id,message_id,original_name,mime_type,size_bytes,width,height,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        attachment_id,
+                        user_id,
+                        thread_id,
+                        None,
+                        original_name[:255] or "image",
+                        mime_type,
+                        len(data),
+                        width,
+                        height,
+                        now,
+                    ),
+                )
+            except Exception:
+                target.unlink(missing_ok=True)
+                raise
+        return {
+            "id": attachment_id,
+            "name": original_name[:255] or "image",
+            "mime_type": mime_type,
+            "size_bytes": len(data),
+            "width": width,
+            "height": height,
+            "preview_url": f"/chat/attachments/{attachment_id}",
+        }
+
+    def attachment_file(self, user_id: str, attachment_id: str) -> tuple[Path, str] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT mime_type FROM chat_attachments WHERE attachment_id=? AND user_id=?",
+                (attachment_id, user_id),
+            ).fetchone()
+        if not row:
+            return None
+        path = self.attachment_root / attachment_id
+        return (path, str(row["mime_type"])) if path.is_file() else None
+
+    def delete_pending_attachment(self, user_id: str, attachment_id: str) -> bool:
+        with self._lock, self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM chat_attachments WHERE attachment_id=? AND user_id=? AND message_id IS NULL",
+                (attachment_id, user_id),
+            )
+        if cursor.rowcount:
+            (self.attachment_root / attachment_id).unlink(missing_ok=True)
+        return cursor.rowcount > 0
+
+    def cleanup_stale_attachments(self) -> int:
+        cutoff = _timestamp(_now() - timedelta(hours=PENDING_ATTACHMENT_HOURS))
+        with self._lock, self.connect() as connection:
+            rows = connection.execute(
+                "SELECT attachment_id FROM chat_attachments WHERE message_id IS NULL AND created_at<?",
+                (cutoff,),
+            ).fetchall()
+            if rows:
+                connection.executemany(
+                    "DELETE FROM chat_attachments WHERE attachment_id=?",
+                    [(row["attachment_id"],) for row in rows],
+                )
+        for row in rows:
+            (self.attachment_root / str(row["attachment_id"])).unlink(missing_ok=True)
+        return len(rows)
+
+    def attachment_model_inputs(
+        self, user_id: str, thread_id: str, attachment_ids: list[str]
+    ) -> list[dict[str, str]]:
+        if not attachment_ids:
+            return []
+        placeholders = ",".join("?" for _ in attachment_ids)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT attachment_id,mime_type FROM chat_attachments
+                WHERE attachment_id IN ({placeholders}) AND user_id=? AND thread_id=? AND message_id IS NOT NULL
+                """,
+                (*attachment_ids, user_id, thread_id),
+            ).fetchall()
+        by_id = {str(row["attachment_id"]): str(row["mime_type"]) for row in rows}
+        if len(by_id) != len(attachment_ids):
+            raise ValueError("图片附件不存在、尚未绑定或不属于当前对话。")
+        return [{"id": attachment_id, "mime_type": by_id[attachment_id]} for attachment_id in attachment_ids]
+
+    def start_turn(
+        self, user_id: str, thread_id: str, message: str, attachment_ids: list[str] | None = None
+    ) -> str:
         """建立或校验线程，并在 Agent 执行前保存用户问题。"""
 
+        attachment_ids = list(dict.fromkeys(attachment_ids or []))
+        if len(attachment_ids) > MAX_CHAT_IMAGES:
+            raise ValueError(f"每条消息最多上传 {MAX_CHAT_IMAGES} 张图片。")
         with self._lock, self.connect() as connection:
             row = connection.execute(
                 "SELECT user_id,pending_turn_id FROM chat_threads WHERE thread_id=?", (thread_id,)
@@ -254,6 +395,26 @@ class UserStore:
                 raise PermissionError("无权访问该对话。")
             if row and row["pending_turn_id"]:
                 raise ValueError("该对话仍有待处理的补充信息或工单确认。")
+            if attachment_ids:
+                placeholders = ",".join("?" for _ in attachment_ids)
+                attachment_rows = connection.execute(
+                    f"""
+                    SELECT attachment_id,user_id,thread_id,message_id,size_bytes
+                    FROM chat_attachments WHERE attachment_id IN ({placeholders})
+                    """,
+                    attachment_ids,
+                ).fetchall()
+                if len(attachment_rows) != len(attachment_ids):
+                    raise ValueError("图片附件不存在或已经失效。")
+                if any(
+                    item["user_id"] != user_id
+                    or item["thread_id"] != thread_id
+                    or item["message_id"] is not None
+                    for item in attachment_rows
+                ):
+                    raise PermissionError("图片附件不属于当前用户或当前对话。")
+                if sum(int(item["size_bytes"]) for item in attachment_rows) > MAX_CHAT_IMAGE_TOTAL_BYTES:
+                    raise ValueError("每条消息的图片总大小不能超过 24 MiB。")
             turn_id = f"turn_{uuid.uuid4().hex}"
             if not row:
                 connection.execute(
@@ -261,7 +422,7 @@ class UserStore:
                     INSERT INTO chat_threads(thread_id,user_id,title,pending_turn_id,created_at,updated_at)
                     VALUES(?,?,?,?,?,?)
                     """,
-                    (thread_id, user_id, self._title(message) or "新对话", turn_id, now, now),
+                    (thread_id, user_id, self._title(message) or "图片分析", turn_id, now, now),
                 )
             else:
                 connection.execute(
@@ -272,13 +433,14 @@ class UserStore:
                     """,
                     (turn_id, now, thread_id),
                 )
+            message_id = f"msg_{uuid.uuid4().hex}"
             connection.execute(
                 """
                 INSERT INTO chat_messages(message_id,thread_id,turn_id,sequence,role,content,created_at)
                 VALUES(?,?,?,?,?,?,?)
                 """,
                 (
-                    f"msg_{uuid.uuid4().hex}",
+                    message_id,
                     thread_id,
                     turn_id,
                     self._next_sequence(connection, thread_id),
@@ -287,6 +449,11 @@ class UserStore:
                     now,
                 ),
             )
+            if attachment_ids:
+                connection.executemany(
+                    "UPDATE chat_attachments SET message_id=? WHERE attachment_id=?",
+                    [(message_id, attachment_id) for attachment_id in attachment_ids],
+                )
         return turn_id
 
     def prepare_resume(self, user_id: str, thread_id: str, message: str | None = None) -> str:
@@ -439,6 +606,14 @@ class UserStore:
                 """,
                 (thread_id,),
             ).fetchall()
+            attachment_rows = connection.execute(
+                """
+                SELECT attachment_id,message_id,original_name,mime_type,size_bytes,width,height
+                FROM chat_attachments WHERE thread_id=? AND user_id=? AND message_id IS NOT NULL
+                ORDER BY created_at
+                """,
+                (thread_id, user_id),
+            ).fetchall()
         artifacts = [
             {
                 "id": row["artifact_id"],
@@ -451,6 +626,20 @@ class UserStore:
         artifact_ids_by_turn: dict[str, list[str]] = {}
         for artifact in artifacts:
             artifact_ids_by_turn.setdefault(str(artifact.pop("turn_id")), []).append(str(artifact["id"]))
+        attachments_by_message: dict[str, list[dict[str, Any]]] = {}
+        for row in attachment_rows:
+            attachment_id = str(row["attachment_id"])
+            attachments_by_message.setdefault(str(row["message_id"]), []).append(
+                {
+                    "id": attachment_id,
+                    "name": row["original_name"],
+                    "mime_type": row["mime_type"],
+                    "size_bytes": row["size_bytes"],
+                    "width": row["width"],
+                    "height": row["height"],
+                    "preview_url": f"/chat/attachments/{attachment_id}",
+                }
+            )
         messages = [
             {
                 "id": row["message_id"],
@@ -458,6 +647,7 @@ class UserStore:
                 "content": row["content"],
                 "generator": row["generator"],
                 "artifact_ids": artifact_ids_by_turn.get(row["turn_id"], []) if row["role"] == "assistant" else [],
+                "attachments": attachments_by_message.get(str(row["message_id"]), []),
                 "created_at": row["created_at"],
             }
             for row in message_rows
@@ -485,7 +675,20 @@ class UserStore:
 
     def delete_thread_records(self, user_id: str, thread_id: str) -> bool:
         with self._lock, self.connect() as connection:
+            attachment_rows = connection.execute(
+                "SELECT attachment_id FROM chat_attachments WHERE thread_id=? AND user_id=?",
+                (thread_id, user_id),
+            ).fetchall()
             cursor = connection.execute(
                 "DELETE FROM chat_threads WHERE thread_id=? AND user_id=?", (thread_id, user_id)
             )
+            if cursor.rowcount:
+                # 已绑定附件会随消息级联删除；这条语句同时清理尚未发送的同线程图片。
+                connection.execute(
+                    "DELETE FROM chat_attachments WHERE thread_id=? AND user_id=?",
+                    (thread_id, user_id),
+                )
+        if cursor.rowcount:
+            for row in attachment_rows:
+                (self.attachment_root / str(row["attachment_id"])).unlink(missing_ok=True)
         return cursor.rowcount > 0

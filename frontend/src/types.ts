@@ -331,7 +331,7 @@ export interface SecurityEventPerson {
   evidence_timestamps?: number[]
 }
 
-export type ChatArtifactType = 'query_result' | 'report' | 'work_order'
+export type ChatArtifactType = 'query_result' | 'report' | 'work_order' | 'rag_retrieval'
 
 export interface ChatArtifact {
   type: ChatArtifactType
@@ -414,12 +414,23 @@ export interface ChatThreadSummary {
   status: 'completed' | 'interrupted' | 'error'
 }
 
+export interface ChatAttachment {
+  id: string
+  name: string
+  mime_type: 'image/jpeg' | 'image/png' | 'image/webp'
+  size_bytes: number
+  width: number
+  height: number
+  preview_url: string
+}
+
 export interface ChatHistoryMessage {
   id: string
   role: 'user' | 'assistant'
   content: string
   generator?: string | null
   artifact_ids: string[]
+  attachments: ChatAttachment[]
   created_at: string
 }
 

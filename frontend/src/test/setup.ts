@@ -21,6 +21,8 @@ Object.defineProperty(window, 'matchMedia', {
     dispatchEvent: () => false,
   }),
 })
+Object.defineProperty(URL, 'createObjectURL', { writable: true, value: vi.fn(() => 'blob:test-image') })
+Object.defineProperty(URL, 'revokeObjectURL', { writable: true, value: vi.fn() })
 
 vi.mock('echarts-for-react', () => ({
   default: ({ option }: { option: unknown }) => createElement('div', {

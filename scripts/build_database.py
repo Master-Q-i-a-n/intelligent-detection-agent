@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+# 脚本集中在 scripts/，所有生成路径仍以项目根目录为准。
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 import duckdb  # noqa: E402
 import numpy as np  # noqa: E402

@@ -17,6 +17,7 @@ import type {
   AuthUser,
   ChatThreadDetail,
   ChatThreadSummary,
+  ChatAttachment,
 } from './types'
 
 export class ApiError extends Error {
@@ -106,7 +107,7 @@ export async function requestJson<T>(path: string, options: RequestOptions = {})
       signal: controller.signal,
       headers: {
         Accept: 'application/json',
-        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}),
         ...options.headers,
       },
     })
@@ -205,10 +206,20 @@ export const api = {
     requestJson<ChatThreadDetail>(`/chat/threads/${encodeURIComponent(threadId)}`, { signal }),
   deleteChatThread: (threadId: string, signal?: AbortSignal) =>
     requestJson<void>(`/chat/threads/${encodeURIComponent(threadId)}`, { method: 'DELETE', signal }),
-  chatTurn: (threadId: string, message: string, signal?: AbortSignal) =>
+  uploadChatAttachment: (threadId: string, file: File, signal?: AbortSignal) => {
+    const body = new FormData()
+    body.append('thread_id', threadId)
+    body.append('file', file, file.name)
+    return requestJson<ChatAttachment>('/chat/attachments', {
+      method: 'POST', body, signal, timeoutMs: 60_000,
+    })
+  },
+  deleteChatAttachment: (attachmentId: string, signal?: AbortSignal) =>
+    requestJson<void>(`/chat/attachments/${encodeURIComponent(attachmentId)}`, { method: 'DELETE', signal }),
+  chatTurn: (threadId: string, message: string, attachmentIds: string[] = [], signal?: AbortSignal) =>
     requestJson<ChatTurnResponse>('/chat/turns', {
       method: 'POST',
-      body: JSON.stringify({ thread_id: threadId, message }),
+      body: JSON.stringify({ thread_id: threadId, message, attachment_ids: attachmentIds }),
       signal,
       timeoutMs: 180_000,
     }),
@@ -219,9 +230,9 @@ export const api = {
       signal,
       timeoutMs: 180_000,
     }),
-  chatTurnStream: (threadId: string, message: string, onEvent: (event: ChatStreamEvent) => void, signal?: AbortSignal) =>
+  chatTurnStream: (threadId: string, message: string, attachmentIds: string[], onEvent: (event: ChatStreamEvent) => void, signal?: AbortSignal) =>
     requestSse('/chat/turns/stream', {
-      method: 'POST', body: JSON.stringify({ thread_id: threadId, message }), onEvent, signal,
+      method: 'POST', body: JSON.stringify({ thread_id: threadId, message, attachment_ids: attachmentIds }), onEvent, signal,
     }),
   chatResumeStream: (payload: ChatResumePayload, onEvent: (event: ChatStreamEvent) => void, signal?: AbortSignal) =>
     requestSse('/chat/resume/stream', {

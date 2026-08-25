@@ -9,6 +9,7 @@ from langchain.agents import create_agent
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 
+import conversation_agent.tools as tools_module
 from conversation_agent.tools import SQL_QUERY_ERROR_CODE, build_agent_tools, build_query_error_middleware
 
 
@@ -89,6 +90,84 @@ def test_work_order_uses_user_id_from_source_reference(tmp_path) -> None:
     assert payload["user_id"] == "1072548130"
     with duckdb.connect(str(result_db), read_only=True) as connection:
         assert connection.execute("SELECT user_id FROM operations.work_order").fetchone()[0] == "1072548130"
+
+
+def test_rag_tool_returns_passages_and_safe_image_artifact(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "database").mkdir()
+    duckdb.connect(str(tmp_path / "database" / "gas_ai_results.duckdb")).close()
+    image = tmp_path / "dataset" / "doc" / "压力传感器" / "images" / "fig_001" / "fig_001.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"png")
+
+    class _FakeRagPipeline:
+        def search(self, query: str, *, hybrid_limit: int, top_n: int):
+            assert query == "压力传感器如何安装？"
+            assert (hybrid_limit, top_n) == (20, 5)
+            return {
+                "original_query": query,
+                "collection": "technical_docs",
+                "results": [{
+                    "point_id": "point-1",
+                    "rrf_score": 0.8,
+                    "rerank_score": 0.95,
+                    "dense": {"rank": 1, "score": 0.9},
+                    "bm25": {"rank": 2, "score": 0.7},
+                    "payload": {
+                        "chunk_id": "chunk-1",
+                        "source": "压力传感器.pdf",
+                        "text": "安装时应避免脉动和过热。",
+                        "page_numbers": [12],
+                        "headings": ["安装要求"],
+                        "images": [{
+                            "image_path": "images/fig_001/fig_001.png",
+                            "page_no": 12,
+                            "image_type": "diagram",
+                            "description": "压力变送器安装示意图",
+                        }],
+                    },
+                }],
+            }
+
+    monkeypatch.setattr(tools_module, "RagPipeline", lambda _config: _FakeRagPipeline())
+    tool = {item.name: item for item in build_agent_tools(tmp_path)}["search_technical_documents"]
+    message = tool.invoke({
+        "name": "search_technical_documents",
+        "args": {"query": "压力传感器如何安装？"},
+        "id": "rag-call-1",
+        "type": "tool_call",
+    })
+
+    content = json.loads(str(message.content))
+    assert content["passages"][0]["reference"] == "资料1"
+    assert content["passages"][0]["text"] == "安装时应避免脉动和过热。"
+    assert content["passages"][0]["images"][0]["markdown"].startswith("![压力变送器安装示意图](/chat/rag-assets/")
+    assert message.artifact["type"] == "rag_retrieval"
+    stored_image = message.artifact["results"][0]["images"][0]
+    assert stored_image["image_path"] == "images/fig_001/fig_001.png"
+    assert stored_image["url"].endswith("/images/fig_001/fig_001.png")
+    assert str(tmp_path) not in str(message.content)
+
+
+def test_rag_tool_hides_internal_failure_details(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "database").mkdir()
+    duckdb.connect(str(tmp_path / "database" / "gas_ai_results.duckdb")).close()
+
+    class _UnavailableRagPipeline:
+        def search(self, *_args, **_kwargs):
+            raise RuntimeError("secret-key and D:/private/qdrant")
+
+    monkeypatch.setattr(tools_module, "RagPipeline", lambda _config: _UnavailableRagPipeline())
+    tool = {item.name: item for item in build_agent_tools(tmp_path)}["search_technical_documents"]
+    message = tool.invoke({
+        "name": "search_technical_documents",
+        "args": {"query": "测试"},
+        "id": "rag-call-error",
+        "type": "tool_call",
+    })
+
+    assert json.loads(str(message.content))["status"] == "unavailable"
+    assert "secret-key" not in str(message.content)
+    assert message.artifact["status"] == "unavailable"
 
 
 def test_agent_rewrites_failed_duckdb_sql_once_and_completes(tmp_path: Path) -> None:

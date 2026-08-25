@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
+# 验证脚本直接运行时需要从项目根目录导入算法模块。
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -17,7 +21,6 @@ from smart_equipment import (  # noqa: E402
     STAGES,
     VibrationDataset,
     apply_temporal_consistency,
-    classify_trend,
     load_model,
     load_npz,
     CACHE_PATH,
