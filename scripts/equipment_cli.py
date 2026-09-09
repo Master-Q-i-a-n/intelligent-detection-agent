@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
+
+from intelligent_detection_agent.smart_equipment import (
+    diagnose_user_day,
+    diagnose_user_trend,
+    export_agent_inputs,
+    train_model,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
-# 支持继续使用 `python scripts/equipment_cli.py` 直接运行。
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from smart_equipment import diagnose_user_day, diagnose_user_trend, export_agent_inputs, train_model
 
 
 def main() -> None:

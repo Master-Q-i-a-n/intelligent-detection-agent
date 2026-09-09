@@ -1,6 +1,8 @@
 param(
     # Production builds are served by FastAPI, so Vite can be skipped.
-    [switch]$ApiOnly
+    [switch]$ApiOnly,
+    # Keep the local vector database location configurable for other machines.
+    [string]$QdrantDir = "D:\Qdrant"
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,6 +13,10 @@ $frontendProcess = $null
 $frontendOutput = $null
 $frontendError = $null
 try {
+    # RAG is an API dependency. The helper is idempotent and waits for readyz.
+    & (Join-Path $PSScriptRoot "scripts\start_qdrant.ps1") `
+        -QdrantDir $QdrantDir
+
     if (-not $ApiOnly) {
         $npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
         if ($null -eq $npmCommand) {
@@ -20,8 +26,10 @@ try {
             throw "Frontend dependencies are missing. Run: npm --prefix frontend install"
         }
 
-        $frontendOutput = Join-Path ([IO.Path]::GetTempPath()) "yaoheng-vite-$PID.out.log"
-        $frontendError = Join-Path ([IO.Path]::GetTempPath()) "yaoheng-vite-$PID.err.log"
+        # Keep each run separate if a previous process still holds its log files.
+        $logPrefix = "yaoheng-vite-$PID-$([guid]::NewGuid().ToString('N'))"
+        $frontendOutput = Join-Path ([IO.Path]::GetTempPath()) "$logPrefix.out.log"
+        $frontendError = Join-Path ([IO.Path]::GetTempPath()) "$logPrefix.err.log"
         $frontendProcess = Start-Process `
             -FilePath $npmCommand.Source `
             -ArgumentList @(
@@ -47,17 +55,60 @@ try {
         Write-Host "Press Ctrl+C to stop both services." -ForegroundColor DarkGray
     }
 
-    uv run python .\run_api.py
+    uv run python -m intelligent_detection_agent
 }
 finally {
-    if ($null -ne $frontendProcess -and -not $frontendProcess.HasExited) {
-        # npm spawns Vite/Node children, so terminate the complete process tree.
-        & taskkill.exe /PID $frontendProcess.Id /T /F 2>$null | Out-Null
-    }
-    foreach ($logPath in @($frontendOutput, $frontendError)) {
-        if ($null -ne $logPath -and (Test-Path -LiteralPath $logPath)) {
-            Remove-Item -LiteralPath $logPath -Force
+    try {
+        if ($null -ne $frontendProcess) {
+            try {
+                if (-not $frontendProcess.HasExited) {
+                    # Wait for tree termination before attempting log cleanup.
+                    $stopProcess = Start-Process -FilePath taskkill.exe `
+                        -ArgumentList @("/PID", $frontendProcess.Id, "/T", "/F") `
+                        -WindowStyle Hidden -PassThru
+                    try {
+                        if (-not $stopProcess.WaitForExit(5000)) {
+                            Write-Warning "Vite process-tree shutdown is still pending."
+                        }
+                    }
+                    finally {
+                        $stopProcess.Dispose()
+                    }
+                    if (-not $frontendProcess.WaitForExit(5000)) {
+                        Write-Warning "Vite has not exited yet (PID $($frontendProcess.Id))."
+                    }
+                }
+            }
+            catch {
+                # Cleanup failures must not replace the original startup/runtime error.
+                Write-Warning "Could not finish Vite shutdown: $($_.Exception.Message)"
+            }
+            finally {
+                $frontendProcess.Dispose()
+            }
+        }
+        foreach ($logPath in @($frontendOutput, $frontendError)) {
+            if ($null -eq $logPath) { continue }
+            # Redirected output handles may take a moment to close after process exit.
+            for ($attempt = 0; $attempt -lt 5; $attempt++) {
+                try {
+                    if (Test-Path -LiteralPath $logPath) {
+                        Remove-Item -LiteralPath $logPath -Force -ErrorAction Stop
+                    }
+                    break
+                }
+                catch {
+                    if ($attempt -eq 4) {
+                        Write-Warning "Temporary log retained: $logPath ($($_.Exception.Message))"
+                    }
+                    else {
+                        Start-Sleep -Milliseconds 200
+                    }
+                }
+            }
         }
     }
-    Pop-Location
+    finally {
+        Pop-Location
+    }
 }

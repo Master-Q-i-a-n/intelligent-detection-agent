@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from inspection_agent import InspectionAgent
+from intelligent_detection_agent.inspection_agent import InspectionAgent
 
 
 class FakeJsonModel:

@@ -31,12 +31,26 @@ dependencies = [
     "httpx>=0.28,<1",
 ]
 
+[project.scripts]
+intelligent-detection-api = "intelligent_detection_agent.__main__:main"
+
+[build-system]
+requires = ["setuptools==83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"intelligent_detection_agent.rag" = ["eval_cases.json"]
+"intelligent_detection_agent.conversation_agent" = ["skills/**/*.md"]
+"intelligent_detection_agent.evaluation" = ["agent_eval_cases.json"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
 ]
 
 [tool.pytest.ini_options]
-# runtime_libs 是历史依赖副本，不应收集其中第三方包自带的测试。
-testpaths = ["tests", "conversation_agent/tests", "safety_operations/tests"]
-pythonpath = ["."]
+testpaths = ["tests"]
+pythonpath = ["src"]

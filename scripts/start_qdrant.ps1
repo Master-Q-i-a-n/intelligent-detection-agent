@@ -14,16 +14,17 @@ try {
     $response = Invoke-WebRequest -Uri $readyUrl -TimeoutSec 2 -UseBasicParsing
     if ($response.StatusCode -eq 200) {
         Write-Host "Qdrant is already ready: $readyUrl" -ForegroundColor Green
-        exit 0
+        # Return to the caller without terminating the parent PowerShell host.
+        return
     }
 }
 catch {
-    # 服务未启动时继续；真正的启动错误在后续健康检查中报告。
+    # Continue when the service is offline; startup checks report real failures.
 }
 
 $previousHost = $env:QDRANT__SERVICE__HOST
 try {
-    # 本地实验库只监听回环地址，避免未鉴权端口暴露到局域网。
+    # Bind the unauthenticated local database to loopback only.
     $env:QDRANT__SERVICE__HOST = "127.0.0.1"
     $process = Start-Process `
         -FilePath $qdrantExe `
@@ -45,11 +46,11 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
         $response = Invoke-WebRequest -Uri $readyUrl -TimeoutSec 2 -UseBasicParsing
         if ($response.StatusCode -eq 200) {
             Write-Host "Qdrant ready: $readyUrl (PID $($process.Id))" -ForegroundColor Green
-            exit 0
+            return
         }
     }
     catch {
-        # 等待服务完成初始化。
+        # Wait for Qdrant initialization to finish.
     }
 }
 

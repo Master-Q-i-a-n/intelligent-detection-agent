@@ -1,22 +1,15 @@
 from __future__ import annotations
 
 import json
-import sys
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
+import torch
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+from torch.utils.data import DataLoader
 
-ROOT = Path(__file__).resolve().parents[1]
-# 验证脚本直接运行时需要从项目根目录导入算法模块。
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score  # noqa: E402
-from torch.utils.data import DataLoader  # noqa: E402
-
-from smart_equipment import (  # noqa: E402
+from intelligent_detection_agent.smart_equipment import (
     MODEL_PATH,
     STAGES,
     VibrationDataset,
@@ -27,6 +20,7 @@ from smart_equipment import (  # noqa: E402
 )
 
 
+ROOT = Path(__file__).resolve().parents[1]
 REPORT_PATH = ROOT / "reports" / "equipment_algorithm_validation.json"
 EXPECTED_TREND = {
     "stable_healthy": "stable",

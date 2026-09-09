@@ -486,8 +486,14 @@ export function ChatPage() {
   }
 
   async function deleteHistoryThread(nextThreadId: string) {
-    if (busy) return
     setHistoryError('')
+    if (nextThreadId === threadId) {
+      // 永久删除当前会话时先忽略迟到事件；后端还会主动终止对应 Agent run。
+      controllerRef.current?.abort()
+      requestTokenRef.current += 1
+      clearStreamingText()
+      setBusy(false)
+    }
     try {
       await api.deleteChatThread(nextThreadId)
       setDeleteConfirmId(null)

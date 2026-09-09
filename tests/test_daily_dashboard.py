@@ -5,7 +5,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
-from daily_dashboard import DAILY_OVERVIEW_ALGORITHM_VERSION, DailyDiagnosisDashboard
+from intelligent_detection_agent.daily_dashboard import (
+    DAILY_OVERVIEW_ALGORITHM_VERSION,
+    DailyDiagnosisDashboard,
+)
 
 
 def test_same_date_concurrent_overview_only_computes_once(tmp_path, monkeypatch):

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from conversation_agent.rag_support import rag_asset_url, resolve_rag_image
+from intelligent_detection_agent.conversation_agent.rag_support import rag_asset_url, resolve_rag_image
 
 
 def test_resolve_rag_image_stays_inside_document_root(tmp_path: Path) -> None:

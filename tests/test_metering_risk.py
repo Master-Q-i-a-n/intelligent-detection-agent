@@ -1,4 +1,4 @@
-from smart_metering import SmartMeteringService
+from intelligent_detection_agent.smart_metering import SmartMeteringService
 
 
 def test_primary_risk_score_is_shared_by_detail_and_overview():

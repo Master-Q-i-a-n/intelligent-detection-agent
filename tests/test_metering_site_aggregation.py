@@ -5,9 +5,9 @@ import numpy as np
 import pandas as pd
 import duckdb
 
-from data_analyse import DataQualityAnalyzer
-import smart_metering
-from smart_metering import SmartMeteringService
+from intelligent_detection_agent import smart_metering
+from intelligent_detection_agent.data_analyse import DataQualityAnalyzer
+from intelligent_detection_agent.smart_metering import SmartMeteringService
 
 
 def _site_rows(site_name: str, pipeline_no: int, flow: float) -> pd.DataFrame:

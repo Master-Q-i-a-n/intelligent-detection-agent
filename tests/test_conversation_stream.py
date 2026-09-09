@@ -9,8 +9,13 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from PIL import Image
 
-from conversation_agent.agent import ConversationAgentService, ReasoningAwareChatDeepSeek
-from conversation_api import _inspect_chat_image, _sse_stream
+from intelligent_detection_agent.conversation_agent.agent import (
+    ConversationAgentService,
+    ReasoningAwareChatDeepSeek,
+    _tool_call_ids,
+)
+from intelligent_detection_agent.conversation_api import _inspect_chat_image, _sse_stream
+from intelligent_detection_agent.evaluation.telemetry import TurnTelemetry
 
 
 class _FakeMessageStream:
@@ -47,7 +52,10 @@ class _FakeRun:
             tool_call_id="tool-1",
             name="get_current_time",
         )
-        self.final_ai = AIMessage(content="查询完成。")
+        self.final_ai = AIMessage(
+            content="查询完成。",
+            usage_metadata={"input_tokens": 20, "output_tokens": 5, "total_tokens": 25},
+        )
         self.final_state = {
             "messages": [self.tool_ai, self.tool_result, self.final_ai],
             "todos": [{"content": "查询当前时间", "status": "completed"}],
@@ -96,10 +104,19 @@ def test_stream_protocol_contains_safe_lifecycle(tmp_path: Path):
         service = ConversationAgentService(tmp_path)
         fake_agent = _FakeAgent()
         service._agent = fake_agent
-        events = [event async for event in service.stream_turn("test-user", "thread-1", "现在几点")]
-        return events, fake_agent.run
+        telemetry = TurnTelemetry()
+        events = [
+            event
+            async for event in service.stream_turn(
+                "test-user",
+                "thread-1",
+                "现在几点",
+                telemetry=telemetry,
+            )
+        ]
+        return events, fake_agent.run, telemetry
 
-    events, run = asyncio.run(collect())
+    events, run, telemetry = asyncio.run(collect())
     names = [event["event"] for event in events]
     assert names[0:2] == ["meta", "status"]
     assert "answer_reset" in names
@@ -108,6 +125,28 @@ def test_stream_protocol_contains_safe_lifecycle(tmp_path: Path):
     assert names[-1] == "done"
     assert events[-1]["data"]["message"] == "查询完成。"
     assert events[-1]["data"]["todos"] == [{"content": "查询当前时间", "status": "completed"}]
+    assert run.aborted is True
+    assert telemetry.as_dict()["llm_call_count"] == 2
+    assert telemetry.as_dict()["tool_calls"][0]["arguments"] == {}
+    assert telemetry.as_dict()["usage"]["total_tokens"] is None
+    assert telemetry.first_token_ms == telemetry.model_calls[-1].first_text_ms
+    assert all("telemetry" not in event["data"] for event in events)
+
+
+def test_cancel_thread_aborts_registered_active_run(tmp_path: Path):
+    async def cancel():
+        service = ConversationAgentService(tmp_path)
+        run = _FakeRun()
+        scoped_thread_id = service._scoped_thread_id("test-user", "thread-running")
+        with service._active_runs_guard:
+            service._active_runs[scoped_thread_id] = run
+
+        cancelled = await service.cancel_thread("test-user", "thread-running")
+        return cancelled, run
+
+    cancelled, run = asyncio.run(cancel())
+
+    assert cancelled is True
     assert run.aborted is True
 
 
@@ -141,6 +180,15 @@ def test_stream_interrupt_is_a_json_object(tmp_path: Path):
     interrupt = next(event for event in events if event["event"] == "interrupt")
     assert interrupt["data"] == {"kind": "clarification", "question": "请补充阈值"}
     assert events[-1]["data"]["status"] == "interrupted"
+
+
+def test_checkpoint_tool_ids_are_available_for_resume_deduplication() -> None:
+    messages = [
+        AIMessage(content="", tool_calls=[{"id": "ask-1", "name": "ask_user", "args": {}}]),
+        ToolMessage(content="已回答", tool_call_id="ask-1"),
+    ]
+
+    assert _tool_call_ids(messages) == {"ask-1"}
 
 
 def test_response_artifacts_only_include_latest_user_turn(tmp_path: Path):

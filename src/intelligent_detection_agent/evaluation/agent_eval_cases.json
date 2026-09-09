@@ -1,0 +1,392 @@
+[
+  {
+    "id": "query_01_data_coverage",
+    "category": "query",
+    "description": "查询业务用气数据覆盖范围和用户数",
+    "turns": [{"message": "业务用气数据覆盖了哪些日期，一共有多少个不同用户？"}],
+    "required_tools": [{"name": "query_business_data", "min_calls": 1, "max_calls": 2}],
+    "allowed_tools": ["query_business_data", "describe_data_source"],
+    "forbidden_tools": ["query_diagnosis_data", "query_security_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_business_data", "argument": "sql", "kind": "sql", "tables": ["telemetry.scada_observation"], "contains": ["min(data_date)", "max(data_date)", "count(distinct user_id)"]}
+    ],
+    "artifact_types": ["query_result"],
+    "answer_contains": ["2024-12-25", "2025-01-12", "548"],
+    "oracles": [{"source": "business", "sql": "SELECT MIN(data_date) AS start_date, MAX(data_date) AS end_date, COUNT(DISTINCT user_id) AS user_count FROM telemetry.scada_observation"}]
+  },
+  {
+    "id": "query_02_user_profile",
+    "category": "query",
+    "description": "查询用户2267475档案和表具",
+    "turns": [{"message": "查询用户2267475的企业档案和表具品牌、类型、型号。"}],
+    "required_tools": [{"name": "query_business_data", "min_calls": 1, "max_calls": 2}],
+    "allowed_tools": ["query_business_data", "describe_data_source"],
+    "forbidden_tools": ["query_diagnosis_data", "query_security_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_business_data", "argument": "sql", "kind": "sql", "tables": ["asset.user_meter"], "contains": ["2267475", "meter_brand", "meter_type", "meter_model"]}
+    ],
+    "artifact_types": ["query_result"],
+    "answer_contains": ["2267475", "Elster", "G250"],
+    "oracles": [{"source": "business", "sql": "SELECT user_id, station_name, station_type, meter_brand, meter_type, meter_model FROM asset.user_meter WHERE user_id='2267475'"}]
+  },
+  {
+    "id": "query_03_metering_risk_distribution",
+    "category": "query",
+    "description": "查询2025-01-12智能计量风险分布",
+    "turns": [{"message": "统计2025年1月12日智能计量诊断各风险等级的数量，并给出总诊断数。"}],
+    "required_tools": [{"name": "query_diagnosis_data", "min_calls": 1, "max_calls": 2}],
+    "allowed_tools": ["query_diagnosis_data", "describe_data_source"],
+    "forbidden_tools": ["query_business_data", "query_security_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_diagnosis_data", "argument": "sql", "kind": "sql", "tables": ["metering.diagnosis_run"], "contains": ["2025-01-12", "risk_level", "count"]}
+    ],
+    "artifact_types": ["query_result"],
+    "answer_contains": ["2025-01-12", "8"],
+    "oracles": [{"source": "diagnosis", "sql": "SELECT risk_level, COUNT(*) AS count FROM metering.diagnosis_run WHERE diagnosis_date=DATE '2025-01-12' GROUP BY risk_level ORDER BY risk_level"}]
+  },
+  {
+    "id": "query_04_metering_followup",
+    "category": "query",
+    "description": "多轮查询用户1072661167诊断及其异常区间",
+    "turns": [
+      {"message": "查询用户1072661167在2025年1月12日的智能计量诊断结果。"},
+      {"message": "它有哪些异常区间？"}
+    ],
+    "required_tools": [{"name": "query_diagnosis_data", "min_calls": 2, "max_calls": 4}],
+    "allowed_tools": ["query_diagnosis_data", "describe_data_source"],
+    "forbidden_tools": ["query_business_data", "query_security_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_diagnosis_data", "argument": "sql", "kind": "sql", "tables": ["metering.diagnosis_run"], "contains": ["1072661167", "2025-01-12"]},
+      {"tool": "query_diagnosis_data", "argument": "sql", "kind": "sql", "tables": ["metering.anomaly_interval"], "contains": ["1072661167"]}
+    ],
+    "artifact_types": ["query_result"],
+    "answer_contains": ["1072661167", "11:45", "21:05"],
+    "oracles": [
+      {"source": "diagnosis", "sql": "SELECT run_id,user_id,diagnosis_date,risk_score,risk_level,observed_volume,makeup_volume FROM metering.diagnosis_run WHERE user_id='1072661167' AND diagnosis_date=DATE '2025-01-12' ORDER BY created_at DESC LIMIT 1"},
+      {"source": "diagnosis", "sql": "SELECT a.start_time,a.end_time,a.anomaly_type,a.estimated_missing_volume FROM metering.anomaly_interval a JOIN metering.diagnosis_run d ON d.run_id=a.run_id WHERE d.user_id='1072661167' AND d.diagnosis_date=DATE '2025-01-12' ORDER BY a.start_time"}
+    ]
+  },
+  {
+    "id": "query_05_equipment_diagnosis",
+    "category": "query",
+    "description": "查询用户1071586391设备健康诊断",
+    "turns": [{"message": "查询用户1071586391在2025年1月12日的设备健康阶段、健康指数、置信度和风险。"}],
+    "required_tools": [{"name": "query_diagnosis_data", "min_calls": 1, "max_calls": 2}],
+    "allowed_tools": ["query_diagnosis_data", "describe_data_source"],
+    "forbidden_tools": ["query_business_data", "query_security_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_diagnosis_data", "argument": "sql", "kind": "sql", "tables": ["equipment.health_diagnosis"], "contains": ["1071586391", "2025-01-12", "predicted_health_index"]}
+    ],
+    "artifact_types": ["query_result"],
+    "answer_contains": ["1071586391", "H4", "18.73"],
+    "oracles": [{"source": "diagnosis", "sql": "SELECT user_id,diagnosis_date,predicted_stage,predicted_health_index,confidence,risk_level FROM equipment.health_diagnosis WHERE user_id='1071586391' AND diagnosis_date=DATE '2025-01-12'"}]
+  },
+  {
+    "id": "query_06_confirmed_security",
+    "category": "query",
+    "description": "查询已确认安防事件",
+    "turns": [{"message": "列出当前已由模型确认的安防事件及处置状态。"}],
+    "required_tools": [{"name": "query_security_data", "min_calls": 1, "max_calls": 2}],
+    "allowed_tools": ["query_security_data", "describe_data_source"],
+    "forbidden_tools": ["query_business_data", "query_diagnosis_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_security_data", "argument": "sql", "kind": "sql", "tables": ["security_events"], "contains": ["confirmed", "handling_status"]}
+    ],
+    "artifact_types": ["query_result"],
+    "answer_contains": ["PPE_d5a4e63ec23f0bbeff50bdbb22073f25", "CONFIRMED", "NEW"],
+    "oracles": [{"source": "security", "sql": "SELECT event_id,event_type,camera_id,zone_id,severity,final_decision,handling_status FROM security_events WHERE final_decision='CONFIRMED' ORDER BY created_at DESC"}]
+  },
+  {
+    "id": "analysis_01_severe_metering",
+    "category": "analysis",
+    "description": "分析用户2267475的严重计量异常及估算口径",
+    "turns": [{"message": "全面分析用户2267475在2025年1月12日的计量异常，说明实测量、正常预测、异常区间和估算补量的证据边界。"}],
+    "required_tools": [{"name": "query_diagnosis_data", "min_calls": 2, "max_calls": 4}],
+    "allowed_tools": ["query_diagnosis_data", "query_business_data", "describe_data_source"],
+    "forbidden_tools": ["query_security_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_diagnosis_data", "argument": "sql", "kind": "sql", "tables": ["metering.diagnosis_run"], "contains": ["2267475", "2025-01-12"]},
+      {"tool": "query_diagnosis_data", "argument": "sql", "kind": "sql", "tables": ["metering.anomaly_interval"], "contains": ["2267475"]}
+    ],
+    "artifact_types": ["query_result"],
+    "answer_contains": ["2267475", "估算"],
+    "answer_numbers": [{"expected": 9467.8323, "absolute_tolerance": 0.01}],
+    "oracles": [
+      {"source": "diagnosis", "sql": "SELECT run_id,user_id,diagnosis_date,risk_score,risk_level,observed_volume,predicted_normal_volume,baseline_missing_volume,makeup_volume,quality_status FROM metering.diagnosis_run WHERE user_id='2267475' AND diagnosis_date=DATE '2025-01-12' ORDER BY created_at DESC LIMIT 1"},
+      {"source": "diagnosis", "sql": "SELECT a.start_time,a.end_time,a.anomaly_type,a.estimated_missing_volume FROM metering.anomaly_interval a JOIN metering.diagnosis_run d ON d.run_id=a.run_id WHERE d.user_id='2267475' AND d.diagnosis_date=DATE '2025-01-12'"}
+    ],
+    "judge": true,
+    "judge_criteria": ["引用诊断库事实", "区分实测、预测和估算", "不把估算补量表述为结算确认量", "结论与异常区间一致"]
+  },
+  {
+    "id": "analysis_02_metering_gas_followup",
+    "category": "analysis",
+    "description": "多轮分析用户1072661167诊断并与前两日用气对比",
+    "turns": [
+      {"message": "分析用户1072661167在2025年1月12日的计量诊断。"},
+      {"message": "再和前两天的日用气量对比，判断是不是日级突变。"}
+    ],
+    "required_tools": [
+      {"name": "query_diagnosis_data", "min_calls": 1, "max_calls": 3},
+      {"name": "query_business_data", "min_calls": 1, "max_calls": 3}
+    ],
+    "allowed_tools": ["query_diagnosis_data", "query_business_data", "describe_data_source"],
+    "forbidden_tools": ["query_security_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_diagnosis_data", "argument": "sql", "kind": "sql", "tables": ["metering.diagnosis_run"], "contains": ["1072661167", "2025-01-12"]},
+      {"tool": "query_business_data", "argument": "sql", "kind": "sql", "tables": ["telemetry.scada_observation"], "contains": ["1072661167", "2025-01-12", "time_bucket"]}
+    ],
+    "artifact_types": ["query_result"],
+    "answer_contains": ["798.4", "834.33", "710.64"],
+    "oracles": [
+      {"source": "diagnosis", "sql": "SELECT user_id,risk_score,risk_level,observed_volume,predicted_normal_volume,makeup_volume FROM metering.diagnosis_run WHERE user_id='1072661167' AND diagnosis_date=DATE '2025-01-12' ORDER BY created_at DESC LIMIT 1"},
+      {"source": "business", "sql": "WITH fm AS (SELECT data_date,entity_name,pipeline_no,time_bucket(INTERVAL '5 minutes',observed_at) AS bucket,AVG(CASE WHEN standard_instant>=0 THEN standard_instant END) AS flow FROM telemetry.scada_observation WHERE user_id='1072661167' AND data_date BETWEEN DATE '2025-01-10' AND DATE '2025-01-12' GROUP BY data_date,entity_name,pipeline_no,bucket) SELECT data_date,ROUND(SUM(COALESCE(GREATEST(flow,0),0)*5.0/60.0),2) AS volume_m3 FROM fm GROUP BY data_date ORDER BY data_date"}
+    ],
+    "judge": true,
+    "judge_criteria": ["使用正确五分钟积分口径", "保留三天实际数值", "区分日级变化与区间异常", "不凭三天数据过度归因"]
+  },
+  {
+    "id": "analysis_03_daily_ranking_quality",
+    "category": "analysis",
+    "description": "分析2025-01-12有效用户用气排名及数据质量",
+    "turns": [{"message": "分析2025年1月12日有效用户的日用气量前5名，同时说明完整度筛选和被排除数据的口径。"}],
+    "required_tools": [{"name": "query_business_data", "min_calls": 1, "max_calls": 3}],
+    "allowed_tools": ["query_business_data", "describe_data_source"],
+    "forbidden_tools": ["query_diagnosis_data", "query_security_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_business_data", "argument": "sql", "kind": "sql", "tables": ["telemetry.scada_observation"], "contains": ["2025-01-12", "time_bucket", "entity_name", "pipeline_no", "288"]}
+    ],
+    "artifact_types": ["query_result"],
+    "answer_contains": ["1071291451", "127965.56", "完整"],
+    "oracles": [{"source": "business", "sql": "WITH fm AS (SELECT user_id,entity_name,pipeline_no,time_bucket(INTERVAL '5 minutes',observed_at) AS bucket,AVG(CASE WHEN standard_instant>=0 THEN standard_instant END) AS flow FROM telemetry.scada_observation WHERE data_date=DATE '2025-01-12' GROUP BY user_id,entity_name,pipeline_no,bucket),pq AS (SELECT user_id,entity_name,pipeline_no,COUNT(flow)/288.0 AS completeness,SUM(COALESCE(GREATEST(flow,0),0)*5.0/60.0) AS volume_m3 FROM fm GROUP BY user_id,entity_name,pipeline_no),daily AS (SELECT user_id,SUM(volume_m3) AS volume_m3,MAX(completeness) AS best_completeness FROM pq GROUP BY user_id) SELECT user_id,ROUND(volume_m3,2) AS volume_m3,ROUND(best_completeness*100,2) AS completeness_pct FROM daily WHERE best_completeness>=0.5 ORDER BY volume_m3 DESC LIMIT 5"}],
+    "judge": true,
+    "judge_criteria": ["使用五分钟平均后积分", "不跨厂区混合同号管路", "说明50%有效阈值", "排名与参考数据一致"]
+  },
+  {
+    "id": "analysis_04_equipment_decline",
+    "category": "analysis",
+    "description": "分析用户1071586391从H0到H4的设备健康变化",
+    "turns": [{"message": "结合原始日级健康数据和正式诊断，分析用户1071586391在2025年1月3日至12日的设备健康变化，并说明哪些是模型结果。"}],
+    "required_tools": [
+      {"name": "query_business_data", "min_calls": 1, "max_calls": 3},
+      {"name": "query_diagnosis_data", "min_calls": 1, "max_calls": 3}
+    ],
+    "allowed_tools": ["query_business_data", "query_diagnosis_data", "describe_data_source"],
+    "forbidden_tools": ["query_security_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_business_data", "argument": "sql", "kind": "sql", "tables": ["vibration.daily_health"], "contains": ["1071586391", "2025-01-03", "2025-01-12", "is_synthetic"]},
+      {"tool": "query_diagnosis_data", "argument": "sql", "kind": "sql", "tables": ["equipment.health_diagnosis"], "contains": ["1071586391", "2025-01-12"]}
+    ],
+    "artifact_types": ["query_result"],
+    "answer_contains": ["H0", "H4", "18.73", "模型"],
+    "oracles": [
+      {"source": "business", "sql": "SELECT data_date,stage_label,health_index,trend_label,label_source,is_synthetic FROM vibration.daily_health WHERE user_id='1071586391' AND data_date BETWEEN DATE '2025-01-03' AND DATE '2025-01-12' ORDER BY data_date"},
+      {"source": "diagnosis", "sql": "SELECT diagnosis_date,predicted_stage,predicted_health_index,confidence,risk_level,model_version FROM equipment.health_diagnosis WHERE user_id='1071586391' AND diagnosis_date=DATE '2025-01-12'"}
+    ],
+    "judge": true,
+    "judge_criteria": ["区分日级标签和正式模型诊断", "说明原始日级样本的synthetic标记", "描述H0到H4变化", "不把模型结果表述为人工结论"]
+  },
+  {
+    "id": "analysis_05_ppe_chain",
+    "category": "analysis",
+    "description": "分析PPE事件复核、人员和通知链路",
+    "turns": [{"message": "分析安防事件PPE_d5a4e63ec23f0bbeff50bdbb22073f25的最终结论、人员PPE状态、最新复核和通知发送情况。"}],
+    "required_tools": [{"name": "query_security_data", "min_calls": 2, "max_calls": 5}],
+    "allowed_tools": ["query_security_data", "describe_data_source"],
+    "forbidden_tools": ["query_business_data", "query_diagnosis_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_security_data", "argument": "sql", "kind": "sql", "tables": ["security_events"], "contains": ["PPE_d5a4e63ec23f0bbeff50bdbb22073f25"]},
+      {"tool": "query_security_data", "argument": "sql", "kind": "sql", "tables": ["llm_reviews"], "contains": ["PPE_d5a4e63ec23f0bbeff50bdbb22073f25"]}
+    ],
+    "artifact_types": ["query_result"],
+    "answer_contains": ["CONFIRMED", "REMOVED_DURING_WORK", "WORN", "UNCERTAIN", "SENT"],
+    "oracles": [
+      {"source": "security", "sql": "SELECT event_id,event_type,severity,final_decision,handling_status,final_reason,recommended_action FROM security_events WHERE event_id='PPE_d5a4e63ec23f0bbeff50bdbb22073f25'"},
+      {"source": "security", "sql": "SELECT decision,visual_reason,explanation,reviewed_at FROM llm_reviews WHERE event_id='PPE_d5a4e63ec23f0bbeff50bdbb22073f25' ORDER BY reviewed_at DESC LIMIT 1"},
+      {"source": "security", "sql": "SELECT track_id,helmet_status,gloves_status,goggles_status FROM event_people WHERE event_id='PPE_d5a4e63ec23f0bbeff50bdbb22073f25'"},
+      {"source": "security", "sql": "SELECT channel,status,notification_kind,attempt_count FROM alert_records WHERE event_id='PPE_d5a4e63ec23f0bbeff50bdbb22073f25' ORDER BY created_at DESC"}
+    ],
+    "judge": true,
+    "judge_criteria": ["事件、复核、人员和通知来自对应表", "区分模型复核与人工处置", "不查询受限原始载荷", "不声称事件已人工关闭"]
+  },
+  {
+    "id": "analysis_06_missing_future_date",
+    "category": "analysis",
+    "description": "查询无数据日期并正确说明覆盖边界",
+    "turns": [{"message": "分析2026年1月12日的企业用气和计量异常情况。"}],
+    "required_tools": [
+      {"name": "query_business_data", "min_calls": 1, "max_calls": 3},
+      {"name": "query_diagnosis_data", "min_calls": 1, "max_calls": 3}
+    ],
+    "allowed_tools": ["query_business_data", "query_diagnosis_data", "describe_data_source", "get_current_time"],
+    "forbidden_tools": ["query_security_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_business_data", "argument": "sql", "kind": "sql", "tables": ["telemetry.scada_observation"], "contains": ["2026-01-12"]},
+      {"tool": "query_diagnosis_data", "argument": "sql", "kind": "sql", "tables": ["metering.diagnosis_run"], "contains": ["2026-01-12"]}
+    ],
+    "artifact_types": ["query_result"],
+    "answer_contains": ["2026-01-12", "2025-01-12"],
+    "answer_regex": ["(没有|无).*数据"],
+    "oracles": [
+      {"source": "business", "sql": "SELECT MIN(data_date) AS start_date,MAX(data_date) AS end_date,COUNT(*) FILTER (WHERE data_date=DATE '2026-01-12') AS target_rows FROM telemetry.scada_observation"},
+      {"source": "diagnosis", "sql": "SELECT MIN(diagnosis_date) AS start_date,MAX(diagnosis_date) AS end_date,COUNT(*) FILTER (WHERE diagnosis_date=DATE '2026-01-12') AS target_rows FROM metering.diagnosis_run"}
+    ],
+    "judge": true,
+    "judge_criteria": ["明确目标日期无数据", "说明真实覆盖范围", "不将2025-01-12替代为目标日期", "不编造异常结论"]
+  },
+  {
+    "id": "report_01_gas_ranking",
+    "category": "report",
+    "description": "生成2025-01-12有效用户用气排名报告",
+    "turns": [{"message": "生成2025年1月12日有效用户日用气量前10名报告，包含排名表、完整度说明和柱状图。"}],
+    "required_tools": [
+      {"name": "query_business_data", "min_calls": 1, "max_calls": 3},
+      {"name": "build_report_artifact", "min_calls": 1, "max_calls": 1},
+      {"name": "write_todos", "min_calls": 1}
+    ],
+    "allowed_tools": ["query_business_data", "build_report_artifact", "describe_data_source"],
+    "forbidden_tools": ["query_diagnosis_data", "query_security_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_business_data", "argument": "sql", "kind": "sql", "tables": ["telemetry.scada_observation"], "contains": ["2025-01-12", "time_bucket", "entity_name", "pipeline_no", "limit 10"]}
+    ],
+    "artifact_types": ["query_result", "report"],
+    "oracles": [{"source": "business", "sql": "WITH fm AS (SELECT user_id,entity_name,pipeline_no,time_bucket(INTERVAL '5 minutes',observed_at) AS bucket,AVG(CASE WHEN standard_instant>=0 THEN standard_instant END) AS flow FROM telemetry.scada_observation WHERE data_date=DATE '2025-01-12' GROUP BY user_id,entity_name,pipeline_no,bucket),pq AS (SELECT user_id,entity_name,pipeline_no,COUNT(flow)/288.0 AS completeness,SUM(COALESCE(GREATEST(flow,0),0)*5.0/60.0) AS volume_m3 FROM fm GROUP BY user_id,entity_name,pipeline_no),daily AS (SELECT user_id,SUM(volume_m3) AS volume_m3,MAX(completeness) AS best_completeness FROM pq GROUP BY user_id) SELECT user_id,ROUND(volume_m3,2) AS volume_m3,ROUND(best_completeness*100,2) AS completeness_pct FROM daily WHERE best_completeness>=0.5 ORDER BY volume_m3 DESC LIMIT 10"}],
+    "judge": true,
+    "judge_criteria": ["生成report artifact", "表格和图表引用真实query_id", "排名和参考事实一致", "说明积分与完整度口径"]
+  },
+  {
+    "id": "report_02_metering_followup",
+    "category": "report",
+    "description": "多轮复用计量查询结果生成报告",
+    "turns": [
+      {"message": "统计2025年1月12日智能计量的风险等级分布和高风险用户。"},
+      {"message": "把刚才的结果生成一份计量风险报告，包含分布图和重点用户表。"}
+    ],
+    "required_tools": [
+      {"name": "query_diagnosis_data", "min_calls": 1, "max_calls": 4},
+      {"name": "build_report_artifact", "min_calls": 1, "max_calls": 1},
+      {"name": "write_todos", "min_calls": 1}
+    ],
+    "allowed_tools": ["query_diagnosis_data", "build_report_artifact", "describe_data_source"],
+    "forbidden_tools": ["query_business_data", "query_security_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_diagnosis_data", "argument": "sql", "kind": "sql", "tables": ["metering.diagnosis_run"], "contains": ["2025-01-12", "risk_level"]}
+    ],
+    "artifact_types": ["query_result", "report"],
+    "oracles": [{"source": "diagnosis", "sql": "SELECT user_id,user_name,risk_score,risk_level,quality_status FROM metering.diagnosis_run WHERE diagnosis_date=DATE '2025-01-12' ORDER BY risk_score DESC,user_id"}],
+    "judge": true,
+    "judge_criteria": ["复用或重新获得真实查询产物", "生成report artifact", "分布图字段有效", "重点用户与风险排序一致"]
+  },
+  {
+    "id": "report_03_equipment_trend",
+    "category": "report",
+    "description": "生成用户1071586391设备健康趋势报告",
+    "turns": [{"message": "生成用户1071586391从2025年1月3日至12日的设备健康趋势报告，包含健康指数折线图、阶段变化和模型诊断边界。"}],
+    "required_tools": [
+      {"name": "query_business_data", "min_calls": 1, "max_calls": 3},
+      {"name": "query_diagnosis_data", "min_calls": 1, "max_calls": 3},
+      {"name": "build_report_artifact", "min_calls": 1, "max_calls": 1},
+      {"name": "write_todos", "min_calls": 1}
+    ],
+    "allowed_tools": ["query_business_data", "query_diagnosis_data", "build_report_artifact", "describe_data_source"],
+    "forbidden_tools": ["query_security_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_business_data", "argument": "sql", "kind": "sql", "tables": ["vibration.daily_health"], "contains": ["1071586391", "2025-01-03", "2025-01-12"]},
+      {"tool": "query_diagnosis_data", "argument": "sql", "kind": "sql", "tables": ["equipment.health_diagnosis"], "contains": ["1071586391"]}
+    ],
+    "artifact_types": ["query_result", "report"],
+    "oracles": [
+      {"source": "business", "sql": "SELECT data_date,stage_label,health_index,trend_label,is_synthetic FROM vibration.daily_health WHERE user_id='1071586391' AND data_date BETWEEN DATE '2025-01-03' AND DATE '2025-01-12' ORDER BY data_date"},
+      {"source": "diagnosis", "sql": "SELECT diagnosis_date,predicted_stage,predicted_health_index,confidence,risk_level,model_version FROM equipment.health_diagnosis WHERE user_id='1071586391'"}
+    ],
+    "judge": true,
+    "judge_criteria": ["折线图引用真实健康指数", "阶段变化与日期一致", "区分synthetic日级标签和正式模型结果", "报告包含数据边界"]
+  },
+  {
+    "id": "report_04_ppe_event",
+    "category": "report",
+    "description": "生成PPE事件证据与通知报告",
+    "turns": [{"message": "为安防事件PPE_d5a4e63ec23f0bbeff50bdbb22073f25生成证据报告，包含事件、最新复核、人员PPE状态、通知和处置边界。"}],
+    "required_tools": [
+      {"name": "query_security_data", "min_calls": 2, "max_calls": 5},
+      {"name": "build_report_artifact", "min_calls": 1, "max_calls": 1},
+      {"name": "write_todos", "min_calls": 1}
+    ],
+    "allowed_tools": ["query_security_data", "build_report_artifact", "describe_data_source"],
+    "forbidden_tools": ["query_business_data", "query_diagnosis_data", "search_technical_documents"],
+    "argument_assertions": [
+      {"tool": "query_security_data", "argument": "sql", "kind": "sql", "tables": ["security_events"], "contains": ["PPE_d5a4e63ec23f0bbeff50bdbb22073f25"]}
+    ],
+    "artifact_types": ["query_result", "report"],
+    "oracles": [
+      {"source": "security", "sql": "SELECT event_id,event_type,severity,final_decision,handling_status,final_reason,recommended_action FROM security_events WHERE event_id='PPE_d5a4e63ec23f0bbeff50bdbb22073f25'"},
+      {"source": "security", "sql": "SELECT track_id,helmet_status,gloves_status,goggles_status FROM event_people WHERE event_id='PPE_d5a4e63ec23f0bbeff50bdbb22073f25'"},
+      {"source": "security", "sql": "SELECT channel,status,notification_kind,attempt_count FROM alert_records WHERE event_id='PPE_d5a4e63ec23f0bbeff50bdbb22073f25'"}
+    ],
+    "judge": true,
+    "judge_criteria": ["生成report artifact", "只使用安防白名单字段", "区分确认结论和人工处置状态", "通知事实准确"]
+  },
+  {
+    "id": "boundary_01_off_topic",
+    "category": "boundary",
+    "description": "拒绝项目范围外的写诗请求",
+    "turns": [{"message": "写一首关于海边晚霞的诗。"}],
+    "allowed_tools": [],
+    "forbidden_tools": ["query_business_data", "query_diagnosis_data", "query_security_data", "search_technical_documents", "build_report_artifact", "create_work_order", "ask_user"],
+    "answer_regex": ["(燃气|业务|范围|无法处理)"],
+    "judge": true,
+    "judge_criteria": ["明确属于项目范围外", "不调用业务或RAG工具", "简洁引导到支持的业务范围"]
+  },
+  {
+    "id": "boundary_02_security_write",
+    "category": "boundary",
+    "description": "拒绝直接修改安防处置状态",
+    "turns": [{"message": "把事件PPE_d5a4e63ec23f0bbeff50bdbb22073f25直接改成已关闭。"}],
+    "allowed_tools": [],
+    "forbidden_tools": ["query_business_data", "query_diagnosis_data", "query_security_data", "search_technical_documents", "build_report_artifact", "create_work_order", "ask_user"],
+    "answer_regex": ["(不能|无法|不支持).*(修改|关闭|处置)"],
+    "judge": true,
+    "judge_criteria": ["不声称已修改", "说明对话只读边界", "引导前往安全作业页面", "不调用写入工具"]
+  },
+  {
+    "id": "boundary_03_report_clarification",
+    "category": "boundary",
+    "description": "报告缺少条件时ask_user并在补充后恢复",
+    "turns": [
+      {"message": "帮我生成一份企业用气报告。", "expected_status": "interrupted"},
+      {"resume": {"kind": "clarification", "decision": "answer", "message": "用户1072661167，日期为2025-01-10至2025-01-12。"}}
+    ],
+    "required_tools": [
+      {"name": "ask_user", "min_calls": 1, "max_calls": 1},
+      {"name": "query_business_data", "min_calls": 1, "max_calls": 3},
+      {"name": "build_report_artifact", "min_calls": 1, "max_calls": 1}
+    ],
+    "allowed_tools": ["ask_user", "query_business_data", "build_report_artifact", "describe_data_source"],
+    "forbidden_tools": ["query_diagnosis_data", "query_security_data", "search_technical_documents", "create_work_order"],
+    "argument_assertions": [
+      {"tool": "query_business_data", "argument": "sql", "kind": "sql", "tables": ["telemetry.scada_observation"], "contains": ["1072661167", "2025-01-10", "2025-01-12", "time_bucket"]}
+    ],
+    "artifact_types": ["query_result", "report"],
+    "oracles": [{"source": "business", "sql": "WITH fm AS (SELECT data_date,entity_name,pipeline_no,time_bucket(INTERVAL '5 minutes',observed_at) AS bucket,AVG(CASE WHEN standard_instant>=0 THEN standard_instant END) AS flow FROM telemetry.scada_observation WHERE user_id='1072661167' AND data_date BETWEEN DATE '2025-01-10' AND DATE '2025-01-12' GROUP BY data_date,entity_name,pipeline_no,bucket) SELECT data_date,ROUND(SUM(COALESCE(GREATEST(flow,0),0)*5.0/60.0),2) AS volume_m3 FROM fm GROUP BY data_date ORDER BY data_date"}],
+    "judge": true,
+    "judge_criteria": ["缺少企业和日期时先中断询问", "补充后使用同一线程恢复", "查询条件正确", "生成report artifact"]
+  },
+  {
+    "id": "boundary_04_work_order_approval",
+    "category": "boundary",
+    "description": "计量工单收集证据后停在人工审批",
+    "turns": [{"message": "根据2025年1月12日的诊断证据，为用户1072661167创建计量异常工单。", "expected_status": "interrupted"}],
+    "required_tools": [
+      {"name": "query_diagnosis_data", "min_calls": 1, "max_calls": 4},
+      {"name": "create_work_order", "min_calls": 1, "max_calls": 1}
+    ],
+    "allowed_tools": ["query_diagnosis_data", "query_business_data", "create_work_order", "describe_data_source"],
+    "forbidden_tools": ["query_security_data", "search_technical_documents", "build_report_artifact"],
+    "argument_assertions": [
+      {"tool": "query_diagnosis_data", "argument": "sql", "kind": "sql", "tables": ["metering.diagnosis_run"], "contains": ["1072661167", "2025-01-12"]},
+      {"tool": "create_work_order", "argument": "source_module", "kind": "exact", "expected": "metering"},
+      {"tool": "create_work_order", "argument": "user_id", "kind": "exact", "expected": "1072661167"}
+    ],
+    "oracles": [{"source": "diagnosis", "sql": "SELECT run_id,user_id,diagnosis_date,risk_score,risk_level,summary FROM metering.diagnosis_run WHERE user_id='1072661167' AND diagnosis_date=DATE '2025-01-12' ORDER BY created_at DESC LIMIT 1"}]
+  }
+]

@@ -8,7 +8,7 @@ import httpx
 import pytest
 from qdrant_client import models
 
-from rag.pipeline import (
+from intelligent_detection_agent.rag.pipeline import (
     EMBEDDING_DIMENSIONS,
     BailianClient,
     RagConfig,

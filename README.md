@@ -17,6 +17,22 @@ uv sync
 npm --prefix frontend install
 ```
 
+### 项目结构
+
+后端采用标准 `src` 布局，运行代码与数据、脚本、测试分离：
+
+```text
+src/intelligent_detection_agent/  Python 后端包
+├─ conversation_agent/            多轮问答与 Skills
+├─ rag/                           技术文档检索
+└─ safety_operations/             安全作业代码
+scripts/                          离线构建、诊断和校验入口
+tests/                            后端测试
+frontend/                         React 前端
+dataset/ database/ models/        本地数据与模型
+reports/ output/                  运行产物
+```
+
 复制 `.env.example` 为 `.env`，按需填写：
 
 - `DEEPSEEK_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`：通用大模型配置。
@@ -32,6 +48,9 @@ npm --prefix frontend install
 ```powershell
 .\start_api.ps1
 ```
+
+该命令会先确认本地 Qdrant 已就绪，再启动后端和前端。Qdrant 默认位于
+`D:\Qdrant`；其他位置可使用 `-QdrantDir` 指定。
 
 - 前端：`http://127.0.0.1:5173/`
 - 后端 API：`http://127.0.0.1:8000/`
@@ -115,7 +134,7 @@ uv run python .\scripts\validate_vibration_database.py
 
 ### 智能计量
 
-`smart_metering.py` 的主要流程：
+`src/intelligent_detection_agent/smart_metering.py` 的主要流程：
 
 1. 读取用户、检定和 SCADA 数据。
 2. 执行五分钟重采样、异常值处理、缺失填充和完整度评价。
@@ -141,7 +160,7 @@ uv run python .\scripts\metering_cli.py `
 
 ### 智能设备
 
-`smart_equipment.py` 使用三轴振动执行多任务健康诊断：
+`src/intelligent_detection_agent/smart_equipment.py` 使用三轴振动执行多任务健康诊断：
 
 1. 按 80/120/160 工况执行训练集统计归一化。
 2. 通过 3/5/9/17 四尺度数学形态学残差提取冲击和包络特征。
@@ -179,7 +198,7 @@ Agent 输入位于 `agent_inputs/equipment_health`。`index.json` 是用户索�
 在 `.env` 配置 `ARK_API_KEY`、`ARK_MODEL_ID` 和 `SAFETY_AGENT_TOKEN` 后显式运行：
 
 ```powershell
-uv run python -m safety_operations.monitor `
+uv run python -m intelligent_detection_agent.safety_operations.monitor `
   --config .\safety_operations\config.yaml `
   --source 'E:\path\to\video.mp4'
 ```
@@ -187,7 +206,7 @@ uv run python -m safety_operations.monitor `
 检测结束后，程序最多对同一源视频执行一次豆包复核。确认问题进入 `alert_records` 并通知平台；证据不足进入人工复核列表；排除事件仅保留审计记录。平台未运行时，可在启动后自动补收，或显式执行：
 
 ```powershell
-uv run python -m safety_operations.notifier `
+uv run python -m intelligent_detection_agent.safety_operations.notifier `
   --config .\safety_operations\config.yaml
 ```
 
@@ -204,7 +223,7 @@ uv run python -m safety_operations.notifier `
 - 创建计量、设备或安防来源工单，写入前必须人工确认。
 - 信息不足时暂停并等待用户补充。
 
-数据库查询使用 `sqlglot` AST、表白名单、只读连接、行数限制、大小限制和超时保护。Agent 没有 Shell 或 Python 执行工具；FilesystemBackend 只读挂载 `conversation_agent/skills`。安防事件在对话中只能查询，确认、处理和关闭必须在安全作业页面完成。
+数据库查询使用 `sqlglot` AST、表白名单、只读连接、行数限制、大小限制和超时保护。Agent 没有 Shell 或 Python 执行工具；FilesystemBackend 只读挂载包内的 `conversation_agent/skills`。安防事件在对话中只能查询，确认、处理和关闭必须在安全作业页面完成。
 
 每个用户可以浏览、继续和删除自己的历史对话。消息、报告、SQL、工单和 checkpoint 存储在 `database/user_data.db`，不同用户通过内部线程编号隔离。回答使用 POST + SSE 流式输出；页面展示可折叠 Todo，但不展示工具流水和模型隐藏推理。
 
@@ -294,27 +313,44 @@ dataset/doc/用气体超声流量计测量天然气流量/ingest/records.json
 
 ```powershell
 .\scripts\start_qdrant.ps1
-uv run python -m rag.cli index --recreate
+uv run python -m intelligent_detection_agent.rag.cli index --recreate
 ```
 
 执行单条查询或两条固定示例：
 
 ```powershell
-uv run python -m rag.cli query "超声流量计单向测量应如何安装？"
-uv run python -m rag.cli demo
+uv run python -m intelligent_detection_agent.rag.cli query "超声流量计单向测量应如何安装？"
+uv run python -m intelligent_detection_agent.rag.cli demo
 ```
 
-运行 20 条人工标注检索评测，报告默认写入
+运行 30 条人工标注检索评测，报告默认写入
 `output/rag_eval_results.json`：
 
 ```powershell
-uv run --env-file .env python -m rag.evaluate
+uv run --env-file .env python -m intelligent_detection_agent.rag.evaluate
 ```
 
 评测同时统计 RRF 混合召回与 qwen3-rerank 的 Recall@K、Hit@K、
 MRR@20、nDCG@K，并保留逐题 Top5 结果，便于定位漏召回。
 
 Agent 按技术文档检索 Skill 将当前问题和必要多轮上下文补全为可独立理解的问题。RAG 管线直接使用该问题执行“1024维向量相似度 + 中文 BM25 → RRF 融合 → qwen3-rerank”，不再额外调用 LLM 改写。Payload 中图片使用相对于文档目录的路径，例如 `images/fig_003/fig_003.png`，不保存机器绝对路径或图片二进制。
+
+## 综合测评
+
+综合测评包含 30 条 RAG 检索用例和 30 条 Agent 端到端用例，其中新增的 10 条 RAG 同时运行两层评测。默认每条执行一次：
+
+```powershell
+# 只检查数据库、Qdrant、模型配置和参考查询，不调用模型
+uv run --env-file .env python -m intelligent_detection_agent.evaluation --preflight
+
+# 完整运行；也可使用 --suite rag、--suite agent、--case 或 --repeat
+uv run --env-file .env python -m intelligent_detection_agent.evaluation --suite all
+
+# 调试确定性规则时可临时关闭独立 LLM 评审
+uv run --env-file .env python -m intelligent_detection_agent.evaluation --suite agent --no-judge
+```
+
+每次报告写入 `output/evaluation/<run_id>/`，包含检索结果、Agent 逐题 JSONL、汇总 JSON 和 Markdown 报告。被测指标包括任务成功率、LLM 调用轮数、工具次数与准确率、参数准确率、端到端延时、首字延时和 token；评审模型的调用和 token 单独记录。
 
 ## 当前数据限制
 

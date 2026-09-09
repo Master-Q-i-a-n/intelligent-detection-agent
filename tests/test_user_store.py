@@ -8,8 +8,8 @@ import pytest
 from langgraph.graph import START, StateGraph
 from typing_extensions import TypedDict
 
-from user_store import UserStore
-from conversation_agent.agent import ThreadedSqliteSaver
+from intelligent_detection_agent.conversation_agent.agent import ThreadedSqliteSaver
+from intelligent_detection_agent.user_store import UserStore
 
 
 class _CheckpointState(TypedDict):

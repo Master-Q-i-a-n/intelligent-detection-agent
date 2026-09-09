@@ -95,6 +95,37 @@ describe('智能问答页面', () => {
     expect(await screen.findByText('已开始新的对话。请告诉我需要查询的对象、时间或报告主题。')).toBeInTheDocument()
   })
 
+  it('停止等待后可以永久删除仍在执行的当前会话', async () => {
+    const runningThread = {
+      thread_id: 'chat_running', title: '正在分析的对话', created_at: '2025-01-01T08:00:00Z',
+      updated_at: '2025-01-01T08:00:01Z', status: 'completed' as const,
+    }
+    vi.mocked(api.chatThreads)
+      .mockResolvedValueOnce({ items: [runningThread] })
+      .mockResolvedValue({ items: [] })
+    vi.mocked(api.chatThread).mockResolvedValue({
+      thread: runningThread,
+      messages: [], artifacts: [], todos: [], interrupt: null, last_error: null,
+    })
+    vi.mocked(api.chatTurnStream).mockImplementation(
+      async (_threadId, _message, _attachmentIds, _onEvent, signal) => new Promise<void>((resolve) => {
+        signal?.addEventListener('abort', () => resolve(), { once: true })
+      }),
+    )
+    vi.mocked(api.deleteChatThread).mockResolvedValue(undefined)
+    render(<ChatPage />)
+
+    fireEvent.click((await screen.findByText('正在分析的对话')).closest('button') as HTMLButtonElement)
+    await waitFor(() => expect(api.chatThread).toHaveBeenCalledWith('chat_running'))
+    fireEvent.change(screen.getByRole('textbox', { name: '对话输入' }), { target: { value: '继续分析' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    fireEvent.click(await screen.findByRole('button', { name: '停止等待' }))
+    fireEvent.click(screen.getByRole('button', { name: '删除对话 正在分析的对话' }))
+    fireEvent.click(screen.getByRole('button', { name: '删除' }))
+
+    await waitFor(() => expect(api.deleteChatThread).toHaveBeenCalledWith('chat_running'))
+  })
+
   it('SQL 查询不会自动打开面板，可由当前回答按钮打开并隐藏', async () => {
     const response: ChatTurnResponse = {
       status: 'completed', message: '共有2户超过阈值。', generator: 'deepagents:deepseek:deepseek-chat', interrupt: null,
