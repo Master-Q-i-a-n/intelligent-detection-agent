@@ -82,6 +82,7 @@ class TurnTelemetry:
     """保存一轮对话的模型、工具和延时指标。"""
 
     started_at: float = field(default_factory=time.monotonic)
+    trajectory: Any | None = field(default=None, repr=False)
     completed_at: float | None = None
     status: str | None = None
     model_calls: list[ModelCallTrace] = field(default_factory=list)

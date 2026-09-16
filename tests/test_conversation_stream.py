@@ -308,6 +308,29 @@ def test_conversation_model_defaults_to_vision_with_high_thinking(tmp_path: Path
     assert model.temperature is None
 
 
+def test_context_window_drives_compaction_without_api_parameter(tmp_path: Path, monkeypatch):
+    import pytest
+    from deepagents.middleware.summarization import compute_summarization_defaults
+
+    monkeypatch.setenv("CHAT_LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("CHAT_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("CHAT_LLM_CONTEXT_WINDOW", "1000000")
+    service = ConversationAgentService(tmp_path)
+    try:
+        model = service._build_model()
+        assert model.profile["max_input_tokens"] == 1_000_000
+        assert compute_summarization_defaults(model)["trigger"] == ("fraction", 0.85)
+        # 容量配置只参与本地上下文管理，不能泄漏成未知 API 参数。
+        payload = model._get_request_payload([HumanMessage(content="测试")])
+        assert "profile" not in payload
+        assert "max_input_tokens" not in payload
+        monkeypatch.setenv("CHAT_LLM_CONTEXT_WINDOW", "0")
+        with pytest.raises(ValueError, match="正整数"):
+            service._build_model()
+    finally:
+        service.close()
+
+
 def test_rag_artifact_is_included_in_current_turn_response(tmp_path: Path):
     service = ConversationAgentService(tmp_path)
     rag_result = ToolMessage(

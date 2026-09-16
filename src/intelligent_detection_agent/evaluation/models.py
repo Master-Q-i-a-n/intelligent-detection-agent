@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -80,3 +81,30 @@ class JudgeResult(BaseModel):
     reason: str
     usage: dict[str, int | None] = Field(default_factory=dict)
     latency_ms: float | None = None
+
+
+class DistillationConfig(BaseModel):
+    threshold: float = Field(default=85, ge=0, le=100, allow_inf_nan=False)
+    weights: tuple[float, float, float] = (0.4, 0.4, 0.2)
+    export_sft: bool = True
+
+    @model_validator(mode="after")
+    def validate_weights(self):
+        if any(not math.isfinite(v) or v < 0 for v in self.weights) or not math.isclose(sum(self.weights), 1, abs_tol=1e-9):
+            raise ValueError("蒸馏权重必须非负、有限且总和为1")
+        return self
+
+
+class ProcessIssue(BaseModel):
+    tool_call_id: str
+    reason: str = Field(min_length=1)
+
+
+class JointJudgeResult(JudgeResult):
+    parameter_score: Literal[0, 25, 50, 75, 100]
+    dependency_score: Literal[0, 25, 50, 75, 100]
+    recovery_score: Literal[0, 25, 50, 75, 100]
+    issues: list[ProcessIssue]
+    redundant_call_ids: list[str]
+    justified_repeats: list[ProcessIssue]
+    unrecovered_failure: bool

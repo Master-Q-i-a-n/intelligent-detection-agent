@@ -39,6 +39,32 @@ def test_security_requires_explicit_safe_columns_but_allows_count_star() -> None
     assert validate_readonly_sql("security", "SELECT COUNT(*) AS total FROM security_events")
 
 
+def test_business_description_only_exposes_queryable_columns(tmp_path: Path) -> None:
+    database_dir = tmp_path / "database"
+    database_dir.mkdir()
+    with duckdb.connect(str(database_dir / "gas_ai_input.duckdb")) as connection:
+        connection.execute("CREATE SCHEMA asset")
+        connection.execute("CREATE TABLE asset.user_meter (user_id VARCHAR, Source_File VARCHAR, meter_brand VARCHAR)")
+    executor = ReadOnlyQueryExecutor(tmp_path)
+    for table in (None, "asset.user_meter"):
+        result = executor.describe("business", table)
+        columns = next(item["columns"] for item in result["tables"] if item["table"] == "asset.user_meter")
+        assert [column["name"] for column in columns] == ["user_id", "meter_brand"]
+    # 隐藏元数据不会改变实际数据库，也不会放开执行权限。
+    with pytest.raises(ReadOnlySQLRejected) as caught:
+        executor.execute("business", "SELECT Source_File FROM asset.user_meter")
+    assert caught.value.denied_columns == ("source_file",)
+
+
+def test_denied_column_metadata_covers_aliases_filters_and_multiple_fields() -> None:
+    with pytest.raises(ReadOnlySQLRejected) as caught:
+        validate_readonly_sql(
+            "security",
+            "SELECT a.PAYLOAD_JSON AS hidden FROM alert_records a WHERE a.source_path IS NOT NULL ORDER BY a.payload_json",
+        )
+    assert caught.value.denied_columns == ("payload_json", "source_path")
+
+
 def test_executor_returns_capped_traceable_query_artifact() -> None:
     executor = ReadOnlyQueryExecutor(ROOT)
     result = executor.execute(

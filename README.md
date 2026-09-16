@@ -41,6 +41,59 @@ reports/ output/                  运行产物
 - `SAFETY_AGENT_TOKEN`：安全作业内部通知鉴权令牌。
 - `AUTH_COOKIE_SECURE`：本地 HTTP 使用 `false`，生产 HTTPS 使用 `true`。
 
+### 通过 SSH 使用服务器上的 vLLM 微调模型
+
+在本机 PowerShell 建立隧道（替换 SSH 用户、地址和端口）：
+
+```powershell
+& "$env:WINDIR\System32\OpenSSH\ssh.exe" -N `
+  -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 `
+  -L 127.0.0.1:18000:127.0.0.1:8000 `
+  -p 2222 用户名@服务器地址
+```
+
+SSH 登录环境必须能访问 vLLM 的 `127.0.0.1:8000`；WSL 部署时，确认 SSH 登录到该 WSL 环境。
+输入密码后保持窗口打开，在另一个本机 PowerShell 验证：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:18000/v1/models
+```
+
+确认模型列表包含 `agent-sft` 后，在 `.env` 中设置：
+
+```dotenv
+CHAT_LLM_PROVIDER=openai-compatible
+CHAT_LLM_BASE_URL=http://127.0.0.1:18000/v1
+CHAT_LLM_API_KEY=local
+CHAT_LLM_MODEL=agent-sft
+CHAT_LLM_CONTEXT_WINDOW=20000
+CHAT_LLM_CHAT_TEMPLATE_KWARGS='{"enable_thinking":false}'
+CHAT_LLM_STREAM_USAGE=true
+```
+
+`local` 是无鉴权 vLLM 的客户端占位 Key；服务器配置鉴权时填写真实 Key。
+`CHAT_LLM_CHAT_TEMPLATE_KWARGS` 必须是 JSON 对象，通过 `extra_body.chat_template_kwargs` 发送；留空不发送，DeepSeek 分支忽略它。`.env` 中保留外层单引号，避免 `uv --env-file` 移除 JSON 内部双引号。
+`CHAT_LLM_THINKING` 只控制 DeepSeek，关闭 Qwen 思考需使用上面的模板参数，参见 [vLLM Qwen 文档](https://docs.vllm.ai/projects/recipes/en/latest/Qwen/Qwen3.5.html)。
+服务端还需启用 `--enable-auto-tool-choice --tool-call-parser qwen3_coder` 才能解析工具调用。
+`CHAT_LLM_STREAM_USAGE=true` 为兼容接口请求 `stream_options.include_usage`，供评测采集真实 Token；仅接受 `true/false`，留空保持 SDK 默认行为，DeepSeek 分支忽略。服务器未返回用量时仍记录缺失，不估算补数。
+
+上下文配置用于本地自动压缩阈值，不会扩大服务器容量。服务器 `max_model_len=20000` 限制输入与输出的总长度；超长请求会报错，不能沿用教师模型的 1M 配置。
+工具在本机执行，服务器负责生成。首次接入验证文本、流式响应和工具调用；模型列表成功不代表多模态链路已验证。
+
+评测前显式填写 `EVAL_JUDGE_PROVIDER/API_KEY/BASE_URL/MODEL` 为教师配置（例如 `deepseek`、教师 Key、`https://api.deepseek.com`、`deepseek-flash`），避免留空后随 Agent 切换成学生模型。密钥只保留在本地 `.env`。
+修改配置后重启后端并新建会话；已有进程会缓存模型配置，终端中已有的同名环境变量也会优先于 `.env`。
+
+先运行一个只读问题，验证包括教师 Judge 和 SFT 筛选在内的链路：
+
+```powershell
+uv run --env-file .env python -m intelligent_detection_agent.evaluation `
+  --suite agent --case query_02_user_profile --repeat 1 --concurrency 1 --distill
+```
+
+未达到筛选阈值时 `sft.jsonl` 为空属正常结果，应检查 `agent_cases.jsonl` 的评分和导出原因。
+隧道窗口关闭或网络断开后，重新运行 SSH 命令并再次检查模型列表；不会自动切回教师模型。
+若 `ssh` 命令找不到，使用上面的完整路径；32 位 PowerShell 访问不到该路径时改用 `$env:WINDIR\Sysnative\OpenSSH\ssh.exe`。
+
 ### 开发模式
 
 一个终端同时启动 Vite 和 FastAPI：
@@ -351,6 +404,54 @@ uv run --env-file .env python -m intelligent_detection_agent.evaluation --suite 
 ```
 
 每次报告写入 `output/evaluation/<run_id>/`，包含检索结果、Agent 逐题 JSONL、汇总 JSON 和 Markdown 报告。被测指标包括任务成功率、LLM 调用轮数、工具次数与准确率、参数准确率、端到端延时、首字延时和 token；评审模型的调用和 token 单独记录。
+
+### 蒸馏筛选与 SFT 导出
+
+评测硬规则只禁止用例明确不允许的工具行为（例如未请求创建工单时调用创建工具）；`allowed_tools` 是 Precision 的预期工具集合，额外查询不自动判任务失败。范围外请求仍禁止业务和 RAG 调用。必要工具、只读 SQL 和目标事实表检查继续保留。
+
+日期接受中文、斜线及 ISO 写法；小数量值采用用例配置的数值容差，支持千位分隔。SQL 不要求固定日期字面量、函数或过滤写法，等价查询、分步查询及返回后筛选由 Judge 根据任务和参考事实核对；关闭 Judge 时不包含这部分语义验证。普通评测中的相关 SQL 用例也会调用 Judge。
+
+轨迹合并仅容忍同一 assistant 发起的完整并行工具返回块内部重排：调用 ID 集合及每个 ID 对应的内容必须完全一致，导出保留首次实际观察到的返回顺序。其他历史改写、缺失、重复或跨步骤移动仍不导出。失败会在 `distillation.trace_error` 中记录首个差异的模型调用序号、消息序号、变化字段、角色及长度，不保存原始消息。旧记录需要重新执行才能验证这项兼容处理；旧评分不能替代新标准的 Judge 评审。
+
+Agent 评测支持 `--concurrency`（默认 1，正整数）。所有“问题 × 重复次数”进入同一个队列，最多同时运行指定数量的完整用例；同一用例内部多轮问答和审批恢复仍按顺序执行。
+
+```powershell
+# 30个Agent用例各跑5次，共150个任务，最多30个用例同时执行
+uv run --env-file .env python -m intelligent_detection_agent.evaluation `
+  --suite agent --repeat 5 --concurrency 30 --distill --distill-threshold 85
+
+# 单个只读问题跑5次，实际并发数为5
+uv run --env-file .env python -m intelligent_detection_agent.evaluation `
+  --suite agent --case query_01_data_coverage --repeat 5 --concurrency 30 --distill
+```
+
+并发上限包括 Agent、Judge 和结果保存，不是严格的 HTTP 请求数上限；工具内部仍可能并行请求。该参数不改变独立 RAG 检索基准的执行方式。普通用例异常记录失败后继续；文件写入等全局错误停止整批并等待活动运行清理。结果 JSONL 和 SFT 按完成顺序写入，使用用例 ID、重复次数、线程 ID 和 SFT 行号对应；Markdown 按用例 ID 和重复次数排序。汇总保存配置并发数、实际 worker 数及整批耗时。模型服务限流可能影响实际吞吐，失败用例不会自动整条重跑。
+
+开启蒸馏后，每个通过硬规则且可完整表示的 Agent 用例使用一次联合 Judge 评审答案和执行过程；入选结果直接写入 `output/evaluation/<run_id>/sft.jsonl`，不另存候选轨迹归档。
+
+```powershell
+uv run --env-file .env python -m intelligent_detection_agent.evaluation `
+  --suite agent --repeat 3 --distill `
+  --distill-threshold 85 --distill-weights 0.4,0.4,0.2
+
+# 只评分，不生成 SFT 文件
+uv run --env-file .env python -m intelligent_detection_agent.evaluation --suite agent --distill --no-export-sft
+
+# 使用已有分项结果重新计算，不调用 Agent/Judge，也不修改已导出的 SFT 文件
+uv run --env-file .env python -m intelligent_detection_agent.evaluation --regrade output/evaluation/<run_id> --distill --distill-threshold 90
+```
+
+- 权重依次为答案、过程、效率，必须非负且总和为 1；阈值范围为 0～100，等于阈值也入选。`--distill` 不能与 `--no-judge` 或纯 `--suite rag` 同用。
+- 答案分为 Judge 的 1～5 分乘以 20；过程分为逐次参数正确性 × 60% + 步骤依赖 × 25% + 错误恢复 × 15%。过程子分使用 0/25/50/75/100 五档。
+- 效率从 100 分开始，每次超预算调用扣 10 分，每次 Judge 确认的无效重复扣 15 分，同一调用只取较高扣分，最低 0 分。HITL 重放不重复计数，合理重试/必要刷新不算无效重复，但仍计入调用预算。
+- 硬规则、答案评审、轨迹完整性和未恢复错误检查是准入条件，不能由高总分抵消。工具 Precision/Recall、Token 与耗时继续报告，不加入加权总分。
+- 评审输入超过 120,000 字符时不截断，记录未评审并不入选；评审失败不会停止后续用例。预期的审批/澄清中断不要求最终正文或尚未执行工具的结果。
+
+每个 SFT 行只包含 `messages` 和 `tools`：使用 `system/user/assistant/tool` 角色、函数工具 Schema、对象形式的 `tool_calls[].function.arguments` 和配对的 `tool_call_id`。每行是一整段用例轨迹，保留实际系统提示和工具结果，不包含 `reasoning_content`、推理标签、Judge 评分或标准答案。训练时需使用支持工具调用的学生模型聊天模板，并只对 assistant 消息计算损失；本项目不修改训练代码。
+
+第一版支持文本轨迹。上下文被压缩/改写、工具定义变化、多模态内容或消息断链不能忠实合并时，记录原因并不导出。入选文件逐条刷新后再删除临时 checkpoint；`agent_cases.jsonl` 保存分项分数、模型、评分版本、筛选配置和 SFT 行号，报告分别统计任务成功、评分入选及实际导出。
+
+**不保存候选轨迹意味着：降低阈值只能重新判定已有分数，不能补导出过去未保存的样本；这些用例需要重新执行。** 旧评测缺少过程评分时不会补默认分。正式训练应与评测用例隔离；同一用例的重复轨迹不要跨训练集和测试集分配。
 
 ## 当前数据限制
 

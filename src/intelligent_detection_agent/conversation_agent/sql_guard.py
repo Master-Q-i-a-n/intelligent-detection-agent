@@ -119,6 +119,11 @@ FORBIDDEN_FUNCTIONS = {
 class ReadOnlySQLRejected(ValueError):
     """表示 SQL 未通过只读安全策略。"""
 
+    def __init__(self, message: str, *, denied_columns: tuple[str, ...] = ()):
+        super().__init__(message)
+        # 只携带已命中策略名单的字段，供工具反馈使用；不转发原始 SQL 或异常文本。
+        self.denied_columns = denied_columns
+
 
 @dataclass(frozen=True)
 class QueryResult:
@@ -202,9 +207,15 @@ def validate_readonly_sql(source: DatabaseSource, sql: str) -> str:
             raise ReadOnlySQLRejected(f"禁止调用外部访问函数 {function_name}。")
 
     denied_columns = DENIED_COLUMNS[source]
-    for column in statement.find_all(exp.Column):
-        if column.name.lower() in denied_columns:
-            raise ReadOnlySQLRejected(f"字段 {column.name} 不允许通过对话查询。")
+    rejected_columns = tuple(sorted({
+        column.name.lower() for column in statement.find_all(exp.Column)
+        if column.name.lower() in denied_columns
+    }))
+    if rejected_columns:
+        raise ReadOnlySQLRejected(
+            f"字段 {', '.join(rejected_columns)} 不允许通过对话查询。",
+            denied_columns=rejected_columns,
+        )
     if source == "security":
         for star in statement.find_all(exp.Star):
             # COUNT(*) 是聚合语义，不会泄露字段；裸星号和 table.* 均拒绝。
@@ -317,7 +328,12 @@ class ReadOnlyQueryExecutor:
                     """,
                     [schema_name, table_name],
                 ).fetchall()
-                output.append({"table": qualified, "columns": [{"name": c, "type": t} for c, t in columns]})
+                # 展示给模型的结构与执行时的字段权限一致，避免诱导查询内部字段。
+                safe_columns = [
+                    {"name": c, "type": t} for c, t in columns
+                    if c.lower() not in DENIED_COLUMNS[source]
+                ]
+                output.append({"table": qualified, "columns": safe_columns})
         return {"source": source, "tables": output}
 
     @staticmethod

@@ -7,12 +7,14 @@ import json
 import os
 import re
 import sqlite3
+import time
 import uuid
 from collections import Counter, defaultdict
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from statistics import fmean
-from typing import Any
+from typing import Any, Callable
 
 import duckdb
 
@@ -23,7 +25,8 @@ from ..rag.pipeline import PROJECT_ROOT, RagConfig, RagPipeline
 from ..safety_operations.env import load_project_env
 from .grading import FRAMEWORK_TOOLS, distribution, grade_arguments, grade_tool_policy
 from .judge import EvaluationJudge
-from .models import AgentEvalCase, ArgumentAssertion, JudgeResult, ToolRequirement
+from .models import AgentEvalCase, ArgumentAssertion, JudgeResult, ToolRequirement, DistillationConfig, JointJudgeResult
+from .distillation import TrajectoryCollector, score_distillation
 from .telemetry import TurnTelemetry
 
 
@@ -96,10 +99,6 @@ def build_rag_agent_cases() -> list[AgentEvalCase]:
                 ],
                 allowed_tools=["search_technical_documents"],
                 forbidden_tools=[
-                    "query_business_data",
-                    "query_diagnosis_data",
-                    "query_security_data",
-                    "build_report_artifact",
                     "create_work_order",
                 ],
                 argument_assertions=[
@@ -263,14 +262,22 @@ async def _run_turn(
     user_id: str,
     thread_id: str,
     turn: Any,
+    trajectory: TrajectoryCollector | None = None,
 ) -> dict[str, Any]:
-    telemetry = TurnTelemetry()
+    telemetry = TurnTelemetry(trajectory=trajectory)
     if turn.resume:
         request = ChatResumeRequest(thread_id=thread_id, **turn.resume)
         source = service.stream_resume(user_id, request, telemetry=telemetry)
     else:
         source = service.stream_turn(user_id, thread_id, str(turn.message), telemetry=telemetry)
-    events = [event async for event in source]
+    events = []
+    try:
+        async for event in source:
+            events.append(event)
+    except Exception as exc:
+        # 保留失败前已收到的事件及真实指标，不记录可能含凭证的异常正文。
+        telemetry.finish("error")
+        events.append({"event": "error", "data": {"message": f"用例执行异常：{type(exc).__name__}"}})
     done = next((event["data"] for event in reversed(events) if event["event"] == "done"), None)
     error = next((event["data"] for event in reversed(events) if event["event"] == "error"), None)
     artifacts = [event["data"] for event in events if event["event"] == "artifact"]
@@ -324,6 +331,8 @@ def _hard_grade(case: AgentEvalCase, turns: list[dict[str, Any]]) -> dict[str, A
     artifacts = list(artifacts_by_key.values())
     calls = _unique_tool_calls(turns)
     failures = []
+    if len(turns) != len(case.turns):
+        failures.append(f"对话轮次未完成：{len(turns)} / {len(case.turns)}")
     for index, turn in enumerate(turns):
         if turn["actual_status"] != turn["expected_status"]:
             failures.append(
@@ -338,12 +347,26 @@ def _hard_grade(case: AgentEvalCase, turns: list[dict[str, Any]]) -> dict[str, A
     for text in case.answer_contains:
         expected_text = text.lower()
         answer_text = answers.lower()
+        # 日期只比较完整年月日，允许中文、斜线和未补零的展示形式。
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", expected_text):
+            dates = {
+                f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
+                for y, m, d in re.findall(r"(?<!\d)(\d{4})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})(?!\d)", answers)
+            }
+            if expected_text not in dates:
+                failures.append(f"答案缺少日期：{text}")
+            continue
         # 展示层允许千位分隔符，不能让 127,965.56 与 127965.56 被判为不同事实。
         if expected_text not in answer_text and expected_text.replace(",", "") not in answer_text.replace(",", ""):
             failures.append(f"答案缺少：{text}")
+    # 仅消除合法三位分组中的横向空白，不合并换行或任意相邻数字。
+    numeric_text = re.sub(
+        r"(?<![\w.])(-?\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?:\.\d+)?)(?![\w.])",
+        lambda match: re.sub(r"[ \u00a0\u202f]", "", match.group()), answers,
+    )
     answer_values = [
         float(value.replace(",", ""))
-        for value in re.findall(r"(?<![\w.])-?\d[\d,]*(?:\.\d+)?", answers)
+        for value in re.findall(r"(?<![\w.])-?\d[\d,]*(?:\.\d+)?", numeric_text)
     ]
     for assertion in case.answer_numbers:
         if not any(abs(value - assertion.expected) <= assertion.absolute_tolerance for value in answer_values):
@@ -398,6 +421,16 @@ def _judge_execution_context(turns: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+async def _run_sync(function, *args):
+    """取消调用者时仍等待后台数据库操作结束，避免提前关闭共享连接。"""
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
 async def run_agent_case(
     service: ConversationAgentService,
     judge: EvaluationJudge | None,
@@ -406,55 +439,120 @@ async def run_agent_case(
     *,
     repeat_index: int,
     run_id: str,
+    distillation: DistillationConfig | None = None,
+    on_result: Callable[[dict[str, Any], dict[str, Any] | None], None] | None = None,
 ) -> dict[str, Any]:
     user_id = f"evaluation-{run_id}"
     thread_id = f"eval_{case.id}_{repeat_index}_{uuid.uuid4().hex[:8]}"
     turns = []
-    oracle_results = execute_oracles(root, case)
-    if case.rag_expected_answer:
-        oracle_results.append(
-            {
-                "source": "rag_ground_truth",
-                "expected_answer": case.rag_expected_answer,
-                "relevant": case.rag_relevant,
-            }
-        )
+    trajectory = TrajectoryCollector() if distillation else None
+    oracle_results = []
+    sample = None
+    started = time.monotonic()
     try:
-        for turn in case.turns:
-            turns.append(await _run_turn(service, user_id, thread_id, turn))
-        hard = _hard_grade(case, turns)
-        judge_result: JudgeResult | None = None
-        if judge is not None and case.judge:
-            execution_error = any(turn["error"] for turn in turns)
-            if execution_error or not hard["answers"].strip():
-                judge_result = JudgeResult(
-                    score=1,
-                    passed=False,
-                    reason="执行报错或最终答案为空，未调用外部评审模型。",
-                    usage={},
-                    latency_ms=0,
+        try:
+            oracle_results = await _run_sync(execute_oracles, root, case)
+            if case.rag_expected_answer:
+                oracle_results.append(
+                    {
+                        "source": "rag_ground_truth",
+                        "expected_answer": case.rag_expected_answer,
+                        "relevant": case.rag_relevant,
+                    }
                 )
-            else:
-                judge_result = await judge.grade(
-                    case,
-                    hard["answers"],
-                    oracle_results,
-                    _judge_execution_context(turns),
+            for turn in case.turns:
+                turns.append(await _run_turn(service, user_id, thread_id, turn, trajectory))
+                if turns[-1]["error"]:
+                    break
+            hard = _hard_grade(case, turns)
+            judge_result: JudgeResult | None = None
+            sample = None
+            distillation_result = None
+            if distillation is not None:
+                trace_error = None
+                judge_error = None
+                joint = None
+                try:
+                    sample = trajectory.sample(expected_interrupt=case.turns[-1].expected_status == "interrupted")
+                except ValueError as exc:
+                    trace_error = str(exc)
+                if hard["passed"] and sample is not None:
+                    try:
+                        if judge is None:
+                            raise ValueError("蒸馏模式需要联合 Judge")
+                        joint = await judge.grade_trajectory(case, oracle_results, sample, {
+                            **_judge_execution_context(turns),
+                            "tool_calls": _unique_tool_calls(turns),
+                        })
+                        judge_result = JudgeResult.model_validate(joint.model_dump())
+                    except Exception as exc:
+                        # 不保存供应商异常正文，避免错误对象带入凭证或完整请求。
+                        judge_error = str(exc) if isinstance(exc, ValueError) else f"联合评审调用失败：{type(exc).__name__}"
+                distillation_result = score_distillation(
+                    case, _unique_tool_calls(turns), hard["passed"], joint, distillation,
+                    trace_error=trace_error, judge_error=judge_error,
                 )
-        success = hard["passed"] and (judge_result is None or (judge_result.passed and judge_result.score >= 4))
-        return {
-            "id": case.id,
-            "category": case.category,
-            "description": case.description,
-            "repeat": repeat_index,
-            "success": success,
-            "hard_grade": hard,
-            "judge": judge_result.model_dump(mode="json") if judge_result else None,
-            "oracle_results": oracle_results,
-            "turns": turns,
-        }
+                distillation_result["models"] = list(dict.fromkeys(c["model"] for c in trajectory.calls.values() if c.get("model")))
+                distillation_result["judge_model"] = getattr(judge, "model_name", None)
+                distillation_result["model_config"] = {
+                    name: getattr(service, name, None)
+                    for name in ("model_name", "provider", "thinking_mode", "reasoning_effort", "chat_template_kwargs", "stream_usage")
+                }
+            elif judge is not None and case.judge:
+                execution_error = any(turn["error"] for turn in turns)
+                if execution_error or not hard["answers"].strip():
+                    judge_result = JudgeResult(
+                        score=1,
+                        passed=False,
+                        reason="执行报错或最终答案为空，未调用外部评审模型。",
+                        usage={},
+                        latency_ms=0,
+                    )
+                else:
+                    judge_result = await judge.grade(
+                        case,
+                        hard["answers"],
+                        oracle_results,
+                        _judge_execution_context(turns),
+                    )
+            success = hard["passed"] and (judge_result is None or (judge_result.passed and judge_result.score >= 4))
+            if distillation is not None:
+                success = hard["passed"] and judge_result is not None and judge_result.passed and judge_result.score >= 4
+            row = {
+                "id": case.id,
+                "category": case.category,
+                "description": case.description,
+                "repeat": repeat_index,
+                "success": success,
+                "hard_grade": hard,
+                "judge": judge_result.model_dump(mode="json") if judge_result else None,
+                "oracle_results": oracle_results,
+                "turns": turns,
+            }
+            if distillation_result is not None:
+                row["distillation"] = distillation_result
+        except Exception as exc:
+            error = f"用例执行异常：{type(exc).__name__}"
+            hard = _hard_grade(case, turns)
+            hard["passed"] = False
+            hard["failures"].append(error)
+            row = {
+                "id": case.id, "category": case.category, "description": case.description,
+                "repeat": repeat_index, "success": False, "hard_grade": hard,
+                "judge": None, "oracle_results": oracle_results, "turns": turns,
+                "execution_error": error,
+            }
+            if distillation is not None:
+                row["distillation"] = score_distillation(
+                    case, _unique_tool_calls(turns), False, None, distillation, judge_error=error,
+                )
+        row["execution_ms"] = round((time.monotonic() - started) * 1000, 2)
+        row["thread_id"] = thread_id
+        if on_result is not None:
+            on_result(row, sample)
+        return row
     finally:
-        service.delete_thread(user_id, thread_id)
+        await _run_sync(service.delete_thread, user_id, thread_id)
 
 
 def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -469,6 +567,7 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     scenario_latency = [
         sum(float(turn["telemetry"]["end_to_end_ms"] or 0) for turn in row["turns"])
         for row in rows
+        if row["turns"] and all(turn["telemetry"]["end_to_end_ms"] is not None for turn in row["turns"])
     ]
     first_tokens = [
         float(turn["telemetry"]["first_token_ms"])
@@ -496,6 +595,7 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         }
     return {
         "case_count": len(rows),
+        **({"distillation": _summarize_distillation(rows)} if any("distillation" in row for row in rows) else {}),
         "task_success_rate": sum(1 for row in rows if row["success"]) / len(rows),
         "tool_call_accuracy": sum(1 for row in rows if row["hard_grade"]["tool"]["passed"]) / len(rows),
         "tool_budget_compliance": (
@@ -515,8 +615,23 @@ def _summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             **distribution([float(value) for value in domain_tool_counts]),
         },
         "end_to_end_ms": distribution(scenario_latency),
-        "first_token_ms": {**distribution(first_tokens), "coverage": len(first_tokens) / sum(len(row["turns"]) for row in rows)},
+        "first_token_ms": {**distribution(first_tokens), "coverage": len(first_tokens) / max(1, sum(len(row["turns"]) for row in rows))},
         "token_usage": usage_summary,
+    }
+
+
+def _summarize_distillation(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    values = [row["distillation"] for row in rows if "distillation" in row]
+    return {
+        "case_count": len(values),
+        "selected_count": sum(value["selected"] for value in values),
+        "selected_rate": sum(value["selected"] for value in values) / len(values) if values else 0,
+        "exported_count": sum(value["exported"] for value in values),
+        "rejection_reasons": dict(Counter(reason for value in values if not value["selected"] for reason in value["issues"])),
+        "scores": {
+            key: distribution([value[key] for value in values if value.get(key) is not None])
+            for key in ("answer_score", "process_score", "efficiency_score", "total_score")
+        },
     }
 
 
@@ -530,7 +645,7 @@ def summarize_agent(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def regrade_saved_run(output_dir: Path) -> dict[str, Any]:
+def regrade_saved_run(output_dir: Path, distillation: DistillationConfig | None = None) -> dict[str, Any]:
     """使用当前确定性规则重判已保存轨迹，不重复调用 Agent 或评审模型。"""
 
     rows_path = output_dir / "agent_cases.jsonl"
@@ -544,8 +659,12 @@ def regrade_saved_run(output_dir: Path) -> dict[str, Any]:
         if case is None:
             raise ValueError(f"当前评测集中不存在用例：{row.get('id')}")
         hard = _hard_grade(case, row["turns"])
+        if row.get("execution_error"):
+            hard["passed"] = False
+            hard["failures"].append(row["execution_error"])
         judge_result = row.get("judge")
-        if case.judge and (any(turn.get("error") for turn in row["turns"]) or not hard["answers"].strip()):
+        expected_interrupt = case.turns[-1].expected_status == "interrupted"
+        if case.judge and (any(turn.get("error") for turn in row["turns"]) or (not hard["answers"].strip() and not (row.get("distillation") and expected_interrupt))):
             judge_result = JudgeResult(
                 score=1,
                 passed=False,
@@ -557,7 +676,30 @@ def regrade_saved_run(output_dir: Path) -> dict[str, Any]:
             judge_result is None
             or (bool(judge_result.get("passed")) and int(judge_result.get("score") or 0) >= 4)
         )
-        regraded.append({**row, "success": success, "hard_grade": hard, "judge": judge_result})
+        updated = {**row, "success": success, "hard_grade": hard, "judge": judge_result}
+        if distillation is not None or row.get("distillation"):
+            saved = row.get("distillation") or {}
+            scoring_config = distillation or DistillationConfig(
+                threshold=saved["threshold"], weights=tuple(saved["weights"]), export_sft=False,
+            )
+            raw_joint = saved.get("joint_judge")
+            try:
+                joint = JointJudgeResult.model_validate(raw_joint) if raw_joint else None
+            except ValueError:
+                joint = None
+            updated["distillation"] = score_distillation(
+                case, _unique_tool_calls(row["turns"]), hard["passed"], joint, scoring_config,
+                trace_error=saved.get("trace_error") if saved else "旧记录缺少完整轨迹及过程评分",
+                judge_error=saved.get("judge_error"),
+            )
+            updated["distillation"].update(
+                exported=bool(saved.get("exported")), sft_line=saved.get("sft_line"),
+                models=saved.get("models", []), judge_model=saved.get("judge_model"),
+                model_config=saved.get("model_config"),
+                regrade_note="只重算评分；未归档的样本不能补导出，已生成SFT文件不变。",
+            )
+            updated["success"] = hard["passed"] and joint is not None and joint.passed and joint.score >= 4
+        regraded.append(updated)
 
     summary = summarize_agent(regraded)
     rows_output = output_dir / "agent_cases_regraded.jsonl"
@@ -600,7 +742,13 @@ def _markdown_report(run_id: str, summary: dict[str, Any], rows: list[dict[str, 
         "| 用例 | 类别 | 成功 | LLM轮数 | 工具数 | 端到端ms | 首字ms | 失败原因 |",
         "|---|---|---:|---:|---:|---:|---:|---|",
     ]
-    for row in rows:
+    execution = summary.get("execution")
+    if execution:
+        lines[4:4] = [
+            f"- 配置并发数：{execution['concurrency']}；实际 worker：{execution['worker_count']}",
+            f"- 整批耗时：{execution['batch_elapsed_ms'] / 1000:.2f} 秒（含初始化和收尾）",
+        ]
+    for row in sorted(rows, key=lambda item: (item["id"], item["repeat"])):
         llm_count = sum(turn["telemetry"]["llm_call_count"] for turn in row["turns"])
         tool_count = len(_unique_tool_calls(row["turns"]))
         latency = sum(float(turn["telemetry"]["end_to_end_ms"] or 0) for turn in row["turns"])
@@ -623,11 +771,22 @@ def _markdown_report(run_id: str, summary: dict[str, Any], rows: list[dict[str, 
             f"| {row['id']} | {row['category']} | {'是' if row['success'] else '否'} | "
             f"{llm_count} | {tool_count} | {latency:.2f} | {first if first is not None else '-'} | {reason} |"
         )
+    if "distillation" in overall:
+        lines.extend(["", "## 蒸馏筛选", "", "任务成功、评分入选与实际导出分别统计；离线重算不会修改SFT文件。", ""])
+        for category, section in [("全部", overall), *summary["by_category"].items()]:
+            stats = section.get("distillation")
+            if stats is None:
+                continue
+            lines.append(f"- {category}：入选 {stats['selected_count']}/{stats['case_count']}（{stats['selected_rate']:.2%}），实际导出 {stats['exported_count']}。")
+            lines.append(f"  分数分布：{json.dumps(stats['scores'], ensure_ascii=False)}")
+            lines.append(f"  淘汰原因：{json.dumps(stats['rejection_reasons'], ensure_ascii=False)}")
+        lines.extend(["", "候选轨迹未归档；降低阈值后，新入选但未保存的样本需要重新执行任务才能导出。"])
     return "\n".join(lines) + "\n"
 
 
 def _combined_markdown(result: dict[str, Any], agent_markdown: str | None) -> str:
-    lines = [f"# 智能检测综合测评报告 {result['run_id']}", ""]
+    lines = [f"# 智能检测综合测评报告 {result['run_id']}", "",
+             "工具白名单仅用于 Precision；黑名单与必要工具为硬规则。SQL 等价路径由 Judge 核对，关闭 Judge 时不包含这部分语义验证。", ""]
     rag = result.get("rag")
     if rag:
         rerank = rag["summary"]["qwen3_rerank"]
@@ -660,31 +819,83 @@ async def run_agent_suite(
     repeat: int,
     judge_enabled: bool,
     run_id: str,
+    distillation: DistillationConfig | None = None,
+    concurrency: int = 1,
 ) -> dict[str, Any]:
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1 or repeat < 1:
+        raise ValueError("concurrency 和 repeat 必须为正整数")
+    if distillation is not None and not judge_enabled:
+        raise ValueError("蒸馏模式不能关闭 Judge")
     service = ConversationAgentService(root)
-    judge = EvaluationJudge(root) if judge_enabled else None
     rows = []
+    started = time.monotonic()
+    total = len(cases) * repeat
+    worker_count = min(concurrency, total)
     try:
-        for repeat_index in range(1, repeat + 1):
-            for index, case in enumerate(cases, start=1):
-                print(f"[{index:02d}/{len(cases)}] {case.id} 第{repeat_index}次")
-                rows.append(
-                    await run_agent_case(
-                        service,
-                        judge,
-                        root,
-                        case,
-                        repeat_index=repeat_index,
-                        run_id=run_id,
-                    )
-                )
+        judge = EvaluationJudge(root) if judge_enabled else None
+        # 先完成模型/工具及共享数据库初始化，再放行 worker。
+        if total:
+            await _run_sync(service._get_agent)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with ExitStack() as stack:
+            results_file = stack.enter_context((output_dir / "agent_cases.jsonl").open("w", encoding="utf-8"))
+            sft_file = stack.enter_context((output_dir / "sft.jsonl").open("w", encoding="utf-8")) if distillation and distillation.export_sft else None
+            sft_line = 0
+
+            def persist(row: dict[str, Any], sample: dict[str, Any] | None) -> None:
+                nonlocal sft_line
+                selection = row.get("distillation")
+                if selection and selection["selected"] and sft_file is not None:
+                    if sample is None:
+                        raise ValueError("入选轨迹缺少SFT样本")
+                    sft_file.write(json.dumps(sample, ensure_ascii=False, allow_nan=False) + "\n")
+                    sft_file.flush()
+                    sft_line += 1
+                    selection.update(exported=True, sft_line=sft_line)
+                results_file.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+                results_file.flush()
+
+            queue: asyncio.Queue[tuple[AgentEvalCase, int]] = asyncio.Queue()
+            stopped = False
+            for repeat_index in range(1, repeat + 1):
+                for case in cases:
+                    queue.put_nowait((case, repeat_index))
+
+            async def worker() -> None:
+                nonlocal stopped
+                while not stopped and not queue.empty():
+                    case, repeat_index = queue.get_nowait()
+                    print(f"[启动，已完成 {len(rows)}/{total}] {case.id} 第{repeat_index}次")
+                    try:
+                        row = await run_agent_case(
+                            service, judge, root, case, repeat_index=repeat_index,
+                            run_id=run_id, distillation=distillation, on_result=persist,
+                        )
+                        rows.append(row)
+                        print(f"[完成 {len(rows)}/{total}] {case.id} 第{repeat_index}次：{'成功' if row['success'] else '失败'}")
+                    except BaseException:
+                        stopped = True
+                        raise
+                    finally:
+                        queue.task_done()
+
+            workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+            try:
+                await asyncio.gather(*workers)
+            finally:
+                # 全局异常或取消：先收尾所有运行，再关闭文件和 checkpoint 连接。
+                for task in workers:
+                    if not task.done() and not task.cancelling():
+                        task.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
     finally:
         service.close()
     summary = summarize_agent(rows)
+    summary["execution"] = {
+        "concurrency": concurrency, "worker_count": worker_count,
+        "total_tasks": total, "batch_elapsed_ms": round((time.monotonic() - started) * 1000, 2),
+    }
     output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "agent_cases.jsonl").open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
     (output_dir / "agent_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
@@ -701,8 +912,15 @@ async def run_evaluation(
     repeat: int = 1,
     judge_enabled: bool = True,
     output_root: Path | None = None,
+    distillation: DistillationConfig | None = None,
+    concurrency: int = 1,
 ) -> dict[str, Any]:
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+        raise ValueError("concurrency 必须为正整数")
+    if distillation is not None and (not judge_enabled or suite == "rag"):
+        raise ValueError("蒸馏模式需要 Agent 用例并开启 Judge")
+    # 防止短时间内重复运行覆盖上一批已导出的训练数据。
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output_dir = (output_root or root / "output" / "evaluation") / run_id
     all_agent_cases = build_rag_agent_cases() + load_agent_cases()
     rag_values = load_rag_cases(DEFAULT_CASES_PATH)
@@ -760,6 +978,8 @@ async def run_evaluation(
             repeat=repeat,
             judge_enabled=judge_enabled,
             run_id=run_id,
+            distillation=distillation,
+            concurrency=concurrency,
         )
         before_count = preflight_report["dataset_fingerprint"]["conversation_work_orders"]["rows"][0][0]
         after_count = dataset_fingerprint(root)["conversation_work_orders"]["rows"][0][0]
@@ -771,6 +991,8 @@ async def run_evaluation(
         "suite": suite,
         "repeat": repeat,
         "judge_enabled": judge_enabled,
+        "concurrency": concurrency,
+        "distillation": distillation.model_dump(mode="json") if distillation else None,
         "rag_case_count": (result.get("rag") or {}).get("case_count", 0),
         "agent_case_count": len((result.get("agent") or {}).get("rows", [])),
         "rag_summary": (result.get("rag") or {}).get("summary"),

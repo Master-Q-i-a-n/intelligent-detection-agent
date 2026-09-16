@@ -48,13 +48,14 @@ def grade_tool_policy(case: AgentEvalCase, calls: list[dict[str, Any]]) -> dict[
 
     unexpected = []
     for name, count in counts.items():
-        if name in forbidden or name not in allowed:
+        if name in forbidden:
             unexpected.extend([name] * count)
     if unexpected:
-        failures.append(f"出现禁止或未允许工具：{', '.join(unexpected)}")
+        failures.append(f"出现禁止工具：{', '.join(unexpected)}")
 
     domain_actual = [name for name in counts.elements() if name not in FRAMEWORK_TOOLS]
-    correct_actual = len(domain_actual) - len(unexpected)
+    # allowed_tools 是预期路径，影响 Precision，但不能把额外只读查询变成硬失败。
+    correct_actual = sum(name in allowed and name not in forbidden for name in domain_actual)
     precision = correct_actual / len(domain_actual) if domain_actual else 1.0
     recall = matched_required / expected_required if expected_required else 1.0
     return {
@@ -65,6 +66,7 @@ def grade_tool_policy(case: AgentEvalCase, calls: list[dict[str, Any]]) -> dict[
         "counts": dict(counts),
         "precision": precision,
         "recall": recall,
+        "additional_tools": sorted(set(counts) - allowed - forbidden),
     }
 
 

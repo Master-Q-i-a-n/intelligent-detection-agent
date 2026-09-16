@@ -280,6 +280,22 @@ class ConversationAgentService:
         self.provider = (os.getenv("CHAT_LLM_PROVIDER") or ("deepseek" if "deepseek" in self.base_url else "openai-compatible")).lower()
         self.thinking_mode = os.getenv("CHAT_LLM_THINKING", "enabled").strip().lower()
         self.reasoning_effort = os.getenv("CHAT_LLM_REASONING_EFFORT", "high").strip().lower()
+        self.chat_template_kwargs: dict[str, Any] | None = None
+        template_config = os.getenv("CHAT_LLM_CHAT_TEMPLATE_KWARGS", "").strip()
+        if self.provider != "deepseek" and template_config:
+            # vLLM 的模板开关与 DeepSeek thinking 参数不同，须按原 JSON 类型透传。
+            try:
+                self.chat_template_kwargs = json.loads(template_config)
+            except ValueError:
+                raise ValueError("CHAT_LLM_CHAT_TEMPLATE_KWARGS 必须是有效的 JSON 对象。") from None
+            if not isinstance(self.chat_template_kwargs, dict):
+                raise ValueError("CHAT_LLM_CHAT_TEMPLATE_KWARGS 必须是有效的 JSON 对象。")
+        self.stream_usage: bool | None = None
+        usage_config = os.getenv("CHAT_LLM_STREAM_USAGE", "").strip().lower()
+        if self.provider != "deepseek" and usage_config:
+            if usage_config not in {"true", "false"}:
+                raise ValueError("CHAT_LLM_STREAM_USAGE 仅支持 true 或 false。")
+            self.stream_usage = usage_config == "true"
         os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
         checkpoint_path = root / "database" / "user_data.db"
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -330,6 +346,10 @@ class ConversationAgentService:
             "max_retries": 2,
             "streaming": True,
         }
+        context_limit = os.getenv("CHAT_LLM_CONTEXT_WINDOW", "").strip()
+        if context_limit:
+            if not context_limit.isdecimal() or int(context_limit) <= 0:
+                raise ValueError("CHAT_LLM_CONTEXT_WINDOW 必须是正整数（Token 数）。")
         if self.provider == "deepseek":
             if self.thinking_mode not in {"enabled", "disabled"}:
                 raise RuntimeError("CHAT_LLM_THINKING 仅支持 enabled 或 disabled。")
@@ -341,10 +361,21 @@ class ConversationAgentService:
                 common.pop("temperature", None)
                 common["reasoning_effort"] = self.reasoning_effort
             model = ReasoningAwareChatDeepSeek(**common)
+            if context_limit:
+                # 本地容量描述供 DeepAgents 压缩阈值使用，不作为供应商请求参数发送。
+                model.profile = {**(model.profile or {}), "max_input_tokens": int(context_limit)}
             model.set_attachment_root(self.root / "database" / "chat_attachments")
             return model
         # 非推理型 OpenAI 兼容模型可以走该分支；推理模型需另做兼容性验证。
-        return ChatOpenAI(**common)
+        if self.chat_template_kwargs is not None:
+            common["extra_body"] = {"chat_template_kwargs": self.chat_template_kwargs}
+        if self.stream_usage is not None:
+            # 自定义 base_url 时 SDK 默认不请求流式用量，vLLM 可显式开启。
+            common["stream_usage"] = self.stream_usage
+        model = ChatOpenAI(**common)
+        if context_limit:
+            model.profile = {**(model.profile or {}), "max_input_tokens": int(context_limit)}
+        return model
 
     def _get_agent(self):
         if self._agent is not None:
@@ -502,6 +533,9 @@ class ConversationAgentService:
             "run_name": "gas-business-conversation",
             "tags": ["gas-business-chat"],
         }
+        # 只在评测显式提供收集器时挂接；普通聊天和前端 SSE 保持不变。
+        if telemetry is not None and telemetry.trajectory is not None:
+            config["callbacks"] = [telemetry.trajectory]
         queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         thread_lock = self._thread_lock(scoped_thread_id)
         run: Any | None = None
@@ -577,6 +611,8 @@ class ConversationAgentService:
                 tool_names: dict[str, str] = {}
                 previous_todos = ""
                 async for state in run.values:
+                    if telemetry is not None and telemetry.trajectory is not None and isinstance(state, dict):
+                        telemetry.trajectory.observe_state(state.get("messages", []))
                     todos = _safe_todos(state.get("todos", [])) if isinstance(state, dict) else []
                     serialized_todos = json.dumps(todos, ensure_ascii=False, sort_keys=True)
                     if serialized_todos != previous_todos:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import threading
 import uuid
 from datetime import datetime
@@ -47,6 +48,24 @@ def _safe_query_error(exc: Exception, request: ToolCallRequest) -> str | None:
     if isinstance(exc, ReadOnlySQLRejected):
         category = "readonly_policy"
         guidance = "SQL 未通过只读或白名单校验。请仅使用单条 SELECT/WITH SELECT、完整 schema.table 和允许字段。"
+        if exc.denied_columns:
+            guidance = (
+                f"字段 {', '.join(exc.denied_columns)} 禁止通过对话查询；这不是表不存在。"
+                "请从 SELECT、WHERE、JOIN、GROUP BY 和 ORDER BY 等所有位置移除这些字段，"
+                "保留完成用户任务所需的允许字段；不要改用 SELECT * 或别名绕过限制。"
+                "不确定可用字段时调用 describe_data_source 核对后再改写。"
+            )
+    elif isinstance(exc, sqlite3.OperationalError):
+        # OperationalError 也包含锁、连接和磁盘故障，只接收明确可由 SQL 改写修复的错误。
+        error = str(exc).lower()
+        if error.startswith(("no such column:", "no such table:", "ambiguous column name:")):
+            category = "sqlite_schema"
+            guidance = "SQLite 表或字段无法解析。请调用 describe_data_source 核对安防表结构、字段和别名后重写，不要猜测字段。"
+        elif (error.startswith("near ") and ": syntax error" in error) or error == "incomplete input":
+            category = "sqlite_syntax"
+            guidance = "SQL 不符合 SQLite 语法。请核对安防库字段和 SQLite SELECT 语法后重写。"
+        else:
+            return None
     elif isinstance(exc, duckdb.BinderException):
         category = "binder"
         guidance = "DuckDB 无法绑定字段或表达式。请检查字段、别名、聚合和 JOIN；禁止使用多列元组 IN 子查询。"
@@ -180,6 +199,7 @@ def _rag_tool_result(root: Path, result: dict[str, Any]) -> tuple[str, dict[str,
     for index, item in enumerate(result.get("results") or [], start=1):
         payload = dict(item.get("payload") or {})
         source = str(payload.get("source") or "未知来源")
+        asset_source = str(payload.get("document_id") or source)
         pages = list(payload.get("page_numbers") or [])
         headings = [str(value) for value in payload.get("headings") or []]
         text = str(payload.get("text") or payload.get("embed_text") or "").strip()
@@ -190,12 +210,12 @@ def _rag_tool_result(root: Path, result: dict[str, Any]) -> tuple[str, dict[str,
             image_path = str(raw_image.get("image_path") or "").strip()
             try:
                 # 只向模型提供当前服务器确实能够读取的安全图片地址。
-                resolve_rag_image(root, source, image_path)
+                resolve_rag_image(root, asset_source, image_path)
             except (ValueError, FileNotFoundError):
                 continue
             image = dict(raw_image)
             image["image_path"] = image_path
-            image["url"] = rag_asset_url(source, image_path)
+            image["url"] = rag_asset_url(asset_source, image_path)
             alt = _safe_markdown_alt(
                 str(image.get("caption") or image.get("description") or f"{source} 资料图片")
             )
@@ -263,7 +283,7 @@ def _rag_tool_result(root: Path, result: dict[str, Any]) -> tuple[str, dict[str,
 
 def build_agent_tools(root: Path) -> list[Any]:
     executor = ReadOnlyQueryExecutor(root)
-    rag_pipeline = RagPipeline(RagConfig.from_env())
+    rag_pipeline = RagPipeline(RagConfig.from_env(), root=root)
     result_database = root / "database" / "gas_ai_results.duckdb"
     initialize_work_order_schema(result_database)
 
