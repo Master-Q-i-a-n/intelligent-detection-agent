@@ -79,3 +79,7 @@ Desktop.ini
 order.txt
 
 docs/项目面试回答.md
+
+# 本地测评用例（保留本地文件，不随代码提交）
+/src/intelligent_detection_agent/evaluation/agent_eval_cases.json
+/src/intelligent_detection_agent/rag/eval_cases.json
