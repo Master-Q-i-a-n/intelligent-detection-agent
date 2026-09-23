@@ -1,9 +1,11 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App, { datesBetween } from './App'
-import { api } from './api'
+import { api, requestJson } from './api'
+import type { UserListResponse } from './types'
 
 vi.mock('./api', () => ({
+  requestJson: vi.fn(),
   api: {
     currentUser: vi.fn(), login: vi.fn(), register: vi.fn(), logout: vi.fn(),
     users: vi.fn(),
@@ -65,12 +67,13 @@ async function openAgentSettings() {
 }
 
 beforeEach(() => {
-  vi.clearAllMocks()
+  vi.resetAllMocks()
   window.localStorage.clear()
   prepareApi()
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.restoreAllMocks()
 })
 
@@ -176,8 +179,62 @@ describe('智能问答入口', () => {
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /智能问答/ }))
     expect(await screen.findByText('燃气业务智能问答')).toBeInTheDocument()
-    expect(screen.getByRole('textbox', { name: '对话输入' })).toBeEnabled()
+    // 问答页面按需加载，等待页面模块完成加载后再检查输入框。
+    expect(await screen.findByRole('textbox', { name: '对话输入' }, { timeout: 5000 })).toBeEnabled()
     expect(screen.queryByLabelText('检测日期')).not.toBeInTheDocument()
+  })
+})
+
+describe('分模块加载', () => {
+  it('设备索引一直未返回时，总览和计量仍能加载', async () => {
+    const metering = await api.users('metering')
+    vi.mocked(api.users).mockImplementation((module) => module === 'equipment'
+      ? new Promise(() => undefined) : Promise.resolve(metering))
+    render(<App />)
+    await screen.findByText('每日全量自诊断')
+    await waitFor(() => expect(api.overview).toHaveBeenCalledWith('2025-01-12', expect.any(AbortSignal)))
+    fireEvent.click(screen.getByRole('button', { name: /智能计量详情/ }))
+    expect(await screen.findByText('存在计量偏差')).toBeInTheDocument()
+  })
+
+  it('全部索引未返回时，可以直接使用问答和知识库', async () => {
+    vi.mocked(api.users).mockImplementation(() => new Promise(() => undefined))
+    vi.mocked(requestJson).mockResolvedValue({ items: [], parser_available: true, worker_error: '', upload_limit_mb: 100 })
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /智能问答/ }))
+    expect(await screen.findByRole('textbox', { name: '对话输入' }, { timeout: 5000 })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: /知识库 Technical Library/ }))
+    expect(await screen.findByRole('button', { name: '上传并处理' })).toBeInTheDocument()
+    expect(api.overview).not.toHaveBeenCalled()
+  })
+
+  it('先切到设备页后，使用晚到的设备企业和日期，计量失败不影响设备', async () => {
+    let resolveEquipment!: (value: UserListResponse) => void
+    vi.mocked(api.users).mockImplementation((module) => module === 'metering'
+      ? Promise.reject(new Error('计量索引离线'))
+      : new Promise((resolve) => { resolveEquipment = resolve }))
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /智能设备详情/ }))
+    expect(api.equipmentDashboard).not.toHaveBeenCalled()
+    await act(async () => resolveEquipment({
+      items: [{ user_id: 'equipment-only', company_name: '设备企业', date_range: ['2025-02-01', '2025-02-02'] }],
+      count: 1, enterprise_count: 1, date_range: ['2025-02-01', '2025-02-02'],
+    }))
+    await waitFor(() => expect(api.equipmentDashboard).toHaveBeenCalledWith('equipment-only', '2025-02-02', expect.any(AbortSignal)))
+    fireEvent.click(screen.getByRole('button', { name: /每日巡检总览/ }))
+    await waitFor(() => expect(api.overview).toHaveBeenCalledWith('2025-02-02', expect.any(AbortSignal)))
+  })
+
+  it('安防慢请求不会堆积，离开应用时取消在途轮询', async () => {
+    vi.useFakeTimers()
+    prepareApi([])
+    vi.mocked(api.securityOverview).mockImplementation(() => new Promise(() => undefined))
+    const view = render(<App />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
+    expect(api.securityOverview).toHaveBeenCalledTimes(1)
+    const signal = vi.mocked(api.securityOverview).mock.calls[0][0]
+    view.unmount()
+    expect(signal?.aborted).toBe(true)
   })
 })
 

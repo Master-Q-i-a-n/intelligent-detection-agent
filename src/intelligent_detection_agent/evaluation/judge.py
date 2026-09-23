@@ -89,6 +89,7 @@ class EvaluationJudge:
     async def grade_trajectory(
         self, case: AgentEvalCase, oracle_results: list[dict[str, Any]],
         sample: dict[str, Any], execution_context: dict[str, Any],
+        *, process_start_index: int | None = None,
     ) -> JointJudgeResult:
         """一次评审答案与过程；完整轨迹是待评数据，不是给 Judge 的指令。"""
         instructions = """
@@ -104,10 +105,26 @@ score 为1到5的整数：1=错误或失败，2=重大遗漏，3=部分正确但
 仅将没有必要的重复调用列入redundant_call_ids；失败后的合理重试、必要刷新列入justified_repeats。
 每个问题必须引用真实tool_call_id，解释可核查的错误；无工具关联的步骤问题允许tool_call_id为空字符串。
 unrecovered_failure 表示存在尚未恢复的执行失败；预期人工中断不属于失败。
+仅当 execution.expected_tool_failure 为 stop_after_retry_exhausted 时，本任务预期工具失败后正确停止：
+按如实说明失败、停止查询、不捏造结果评价任务完成度；符合该预期不标记 unrecovered_failure。
+该例外不适用于未声明的工具错误、继续违规查询或 Agent 自身执行异常。
 返回字段：score, passed, reason, parameter_score, dependency_score, recovery_score,
 issues（[{"tool_call_id":"...","reason":"..."}]）, redundant_call_ids（字符串数组）,
 justified_repeats（[{"tool_call_id":"...","reason":"..."}]）, unrecovered_failure（布尔值）。
 """.strip()
+        # 普通评测始终评完整过程；只有生成恢复训练样本时显式指定监督起点。
+        if process_start_index is not None:
+            if (type(process_start_index) is not int or not 0 <= process_start_index < len(sample["messages"])
+                    or sample["messages"][process_start_index]["role"] != "assistant"):
+                raise ValueError("恢复评审起点必须是有效 assistant 消息索引")
+            instructions += (
+                f"\n本次是恢复样本的监督区间评审，messages 从0计数，起点为 {process_start_index}。"
+                "之前的消息仅作为真实错误历史和已知事实，不是学习目标。"
+                "本次过程评分、issues、重复调用判定只评价起点及之后的动作，覆盖前述完整过程扣分要求；"
+                "不得因为前缀错误扣本次过程分，也不得忽略监督区间新发生的错误。"
+                "答案正确性、任务完成度和 unrecovered_failure 仍结合全轨迹及参考事实判断。"
+                "必须确认原错误已实际恢复，禁止把执行失败解释为空结果或以无关查询成功冒充恢复。"
+            )
         payload = json.dumps({
             "task": case.description, "turns": [t.model_dump(mode="json") for t in case.turns],
             "criteria": case.judge_criteria or ["事实准确", "回答完整", "结论相关", "说明数据边界"],
@@ -115,7 +132,8 @@ justified_repeats（[{"tool_call_id":"...","reason":"..."}]）, unrecovered_fail
         }, ensure_ascii=False, default=str)
         if len(instructions) + len(payload) + 100 > 120_000:
             raise ValueError("联合评审输入超过120000字符，未截断、未评审")
-        known_ids = {c["id"] for m in sample["messages"] for c in m.get("tool_calls", [])}
+        known_ids = {c["id"] for m in sample["messages"][process_start_index or 0:]
+                     for c in m.get("tool_calls", [])}
         model = self._build_model()
         started = time.monotonic()
         messages = []

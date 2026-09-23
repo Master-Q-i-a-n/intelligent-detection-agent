@@ -266,8 +266,10 @@ def _artifact_progress(artifact: ChatArtifact | None) -> dict[str, Any] | None:
 class ConversationAgentService:
     """持有按登录用户隔离、可跨进程恢复的对话与 HITL 检查点。"""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, additional_middleware: list[Any] | None = None):
         self.root = root
+        # 离线数据生成可注入限额/故障模拟；线上默认不改变工具行为。
+        self.additional_middleware = list(additional_middleware or [])
         load_project_env(root / ".env")
         self.model_name = os.getenv("CHAT_LLM_MODEL") or DEFAULT_CHAT_MODEL
         self.base_url = (os.getenv("CHAT_LLM_BASE_URL") or os.getenv("LLM_BASE_URL", "https://api.deepseek.com")).rstrip("/")
@@ -412,7 +414,7 @@ class ConversationAgentService:
                 skills=["/skills/"],
                 permissions=permissions,
                 backend=backend,
-                middleware=[build_query_error_middleware(), TodoListMiddleware()],
+                middleware=[*self.additional_middleware, build_query_error_middleware(), TodoListMiddleware()],
                 interrupt_on={
                     "create_work_order": {
                         "allowed_decisions": ["approve", "edit", "reject"],

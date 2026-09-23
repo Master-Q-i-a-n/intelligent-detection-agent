@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, ClipboardEvent as ReactClipboardEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from 'react'
-import ReactECharts from 'echarts-for-react'
+import type ReactECharts from 'echarts-for-react'
+import { LazyECharts } from '../components/LazyECharts'
 import type { EChartsOption } from 'echarts'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -217,12 +218,14 @@ function ReportViewer({ report }: { report: ReportPayload }) {
           return (
             <section key={chart.id}>
               <h4>{chart.title}<small>{chart.unit}</small></h4>
-              <ReactECharts
+              <Suspense fallback={<div className="chart-empty" role="status" style={{ height: 320 }}>正在加载图表</div>}>
+              <LazyECharts
                 ref={(instance) => { chartRefs.current[chart.id] = instance }}
                 option={chartOption(chart, dataset)}
                 notMerge
                 style={{ width: '100%', height: 320 }}
               />
+              </Suspense>
               <p>数据来源：{chart.source_query_id}</p>
             </section>
           )

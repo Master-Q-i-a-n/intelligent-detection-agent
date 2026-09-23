@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
 import threading
+import time
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Literal, TypedDict
@@ -372,7 +375,19 @@ class InspectionAgent:
             return "".join(str(item.get("text", "")) if isinstance(item, dict) else str(item) for item in content)
         return str(content or "")
 
-    def _invoke_llm(self, state: InspectionState, fallback: dict[str, Any]) -> LlmInterpretation:
+    def _write_llm_record(self, record: dict[str, Any]) -> None:
+        """每次调用独立文件，原子替换快照；记录失败不影响业务解读，但明确报告。"""
+        path = self.root / "output" / "inspection_llm" / f"{record['request_id']}.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+            temporary.replace(path)
+        except OSError as exc:
+            record["recording_error"] = type(exc).__name__
+            logging.getLogger(__name__).error("诊断输入输出记录写入失败 request_id=%s error=%s", record["request_id"], type(exc).__name__)
+
+    def _invoke_llm(self, state: InspectionState, fallback: dict[str, Any], record: dict[str, Any] | None = None) -> LlmInterpretation:
         if self.model_client is None:
             raise RuntimeError("未配置检查解读模型")
         prompt = {
@@ -391,9 +406,37 @@ class InspectionAgent:
         ]
         # JSON mode只保证语法，随后必须由 Pydantic 校验字段和范围。
         model = self.model_client.bind(response_format={"type": "json_object"}) if hasattr(self.model_client, "bind") else self.model_client
+        if record is not None:
+            # 白名单记录调用输入，不序列化客户端、请求头或凭证。
+            record["input"] = {
+                "messages": [{"role": "user" if role == "human" else role, "content": text} for role, text in messages],
+                "parameters": {**{name: getattr(self.model_client, name, None) for name in
+                                  ("temperature", "max_tokens", "streaming", "max_retries")},
+                               "response_format": {"type": "json_object"}},
+            }
+            record["status"] = "request_started"
+            self._write_llm_record(record)
+        started = time.monotonic()
         response = model.invoke(messages)
+        if record is not None:
+            metadata = getattr(response, "response_metadata", {}) or {}
+            record["output"] = {
+                "content": getattr(response, "content", response),
+                "reasoning_content": (getattr(response, "additional_kwargs", {}) or {}).get("reasoning_content"),
+                "usage_metadata": getattr(response, "usage_metadata", None),
+                "response_metadata": {key: metadata[key] for key in
+                                      ("token_usage", "finish_reason", "model_name", "model_provider", "system_fingerprint") if key in metadata},
+            }
+            record["latency_ms"] = round((time.monotonic() - started) * 1000, 2)
+            record["status"] = "response_received"
+            # 解析前先落盘，格式错误的响应也保留原文和代码围栏。
+            self._write_llm_record(record)
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", self._message_text(response).strip(), flags=re.IGNORECASE)
-        return LlmInterpretation.model_validate_json(content)
+        parsed = LlmInterpretation.model_validate_json(content)
+        if record is not None:
+            record["parsed_output"] = parsed.model_dump(mode="json")
+            record["status"] = "parsed"
+        return parsed
 
     @staticmethod
     def _stable_value(value: Any) -> Any:
@@ -484,14 +527,35 @@ class InspectionAgent:
             cached = self._get_cached(fingerprint)
             if cached is not None:
                 return {"fallback_report": fallback, "final_report": cached}
+            record = {
+                "request_id": f"{datetime.now():%Y%m%dT%H%M%S}_{uuid.uuid4().hex}",
+                "created_at": datetime.now().astimezone().isoformat(),
+                "report_id": f"IR-{fingerprint[:16]}", "input_fingerprint": fingerprint,
+                "workflow_version": WORKFLOW_VERSION, "module": state["module"],
+                "user_id": state["user_id"], "diagnosis_date": state["diagnosis_date"],
+                "workflow_route": state["workflow_route"], "model": self.model_name,
+                "provider": self.provider, "status": "prepared", "input": None, "output": None,
+            }
             try:
-                parsed = self._invoke_llm(state, fallback)
+                parsed = self._invoke_llm(state, fallback, record)
                 report = self._merge_report(state, parsed.model_dump(mode="json"), fingerprint=fingerprint, generator=f"workflow-llm:{self.model_name}")
+                report["llm_request_id"] = record["request_id"]
                 self._save_cached(fingerprint, state, report)
+                record["status"] = "completed"
             except Exception as exc:
                 # 网络、供应商兼容或结构校验失败均不得让算法页面失去解释结果。
                 report = self._merge_report(state, fallback, fingerprint=fingerprint, generator="workflow-local-fallback")
                 report["llm_notice"] = f"模型解读不可用，已采用可审计工作流回退：{type(exc).__name__}"
+                record["failed_stage"] = record["status"]
+                record["status"] = "fallback"
+                # 异常正文可能包含供应商请求信息，日志仅记录异常类型。
+                record["error_type"] = type(exc).__name__
+            report["llm_request_id"] = record["request_id"]
+            record["final_report"] = report.copy()
+            record["finished_at"] = datetime.now().astimezone().isoformat()
+            self._write_llm_record(record)
+            if record.get("recording_error"):
+                report["llm_recording_notice"] = "本次输入输出记录写入失败，请检查服务端日志和输出目录。"
             return {"fallback_report": fallback, "final_report": report}
 
     def generate(self, module: str, user_id: str, diagnosis_date: str, field_text: str = "", context: dict[str, Any] | None = None) -> dict[str, Any]:

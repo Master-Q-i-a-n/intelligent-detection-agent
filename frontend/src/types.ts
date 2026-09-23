@@ -1,4 +1,4 @@
-export type PageKey = 'overview' | 'metering' | 'equipment' | 'safety' | 'chat'
+export type PageKey = 'overview' | 'metering' | 'equipment' | 'safety' | 'chat' | 'knowledge'
 export type BusinessModule = 'metering' | 'equipment'
 
 export interface UserSummary {

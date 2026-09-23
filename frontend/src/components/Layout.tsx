@@ -7,9 +7,11 @@ const navItems: Array<{ key: PageKey; label: string; english: string }> = [
   { key: 'equipment', label: '智能设备详情', english: 'Equipment Evidence' },
   { key: 'safety', label: '安全作业', english: 'Safety Operations' },
   { key: 'chat', label: '智能问答', english: 'AI Assistant' },
+  { key: 'knowledge', label: '知识库', english: 'Technical Library' },
 ]
 
 function NavIcon({ page }: { page: PageKey }) {
+  if (page === 'knowledge') return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 3h12l4 4v14H4zM15 3v5h5M8 12h8M8 16h8" /></svg>
   // 图标均使用 currentColor，激活态自动继承侧栏的仪表青色。
   if (page === 'overview') return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" /></svg>
   if (page === 'metering') return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19a8 8 0 1 1 14 0M12 12l4-3M8 19h8" /><circle cx="12" cy="12" r="1.3" /></svg>
@@ -359,6 +361,7 @@ export function Topbar({
     equipment: ['智能设备健康中心', 'EQUIPMENT HEALTH EVIDENCE'],
     safety: ['安全作业事件中心', 'SAFETY OPERATIONS CENTER'],
     chat: ['燃气业务智能问答', 'GAS BUSINESS AI ASSISTANT'],
+    knowledge: ['技术知识库', 'TECHNICAL DOCUMENT LIBRARY'],
   }
   return (
     <header className="topbar">
@@ -367,17 +370,17 @@ export function Topbar({
         <h1>{titles[page][0]}</h1>
       </div>
       <div className="filters">
-        {page !== 'overview' && page !== 'safety' && page !== 'chat' && (
+        {page !== 'overview' && page !== 'safety' && page !== 'chat' && page !== 'knowledge' && (
           <label>
             <span>检测企业</span>
             <EnterpriseCombobox users={users} userId={userId} onUserChange={onUserChange} />
           </label>
         )}
-        {page !== 'safety' && page !== 'chat' && <label>
+        {page !== 'safety' && page !== 'chat' && page !== 'knowledge' && <label>
           <span>检测日期</span>
           <DateCombobox dates={dates} date={date} onDateChange={onDateChange} />
         </label>}
-        {page !== 'chat' && (
+        {page !== 'chat' && page !== 'knowledge' && (
           <button className="button button-primary" type="button" disabled={busy || (page !== 'safety' && !date)} onClick={onRefresh}>
             {busy ? '数据处理中…' : page === 'overview' ? '执行每日全量诊断' : page === 'safety' ? '刷新安防事件' : '刷新诊断证据'}
           </button>

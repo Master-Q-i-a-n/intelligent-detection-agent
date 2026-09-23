@@ -119,6 +119,42 @@ def test_metering_workflow_routes_and_reuses_successful_fingerprint(tmp_path):
     assert second["cache_hit"] is True
     assert model.calls == 1
     assert model.bound_options == {"response_format": {"type": "json_object"}}
+    records = list((tmp_path / "output/inspection_llm").glob("*.json"))
+    assert len(records) == 1  # 缓存命中不能伪造一次新调用。
+    record = json.loads(records[0].read_text(encoding="utf-8"))
+    assert record["request_id"] == first["llm_request_id"] == second["llm_request_id"]
+    assert record["report_id"] == first["report_id"]
+    assert record["status"] == "completed"
+    prompt = json.loads(record["input"]["messages"][1]["content"])
+    assert prompt["field_information"] == "阀门已核对"
+    assert "fallback_reference" in prompt
+    assert json.loads(record["output"]["content"]) == valid_interpretation()
+    assert "FAKE-ID" in record["parsed_output"]["possible_causes"][0]["supporting_evidence_ids"]
+    assert "FAKE-ID" not in record["final_report"]["possible_causes"][0]["supporting_evidence_ids"]
+
+
+def test_llm_record_keeps_unparseable_response_and_reasoning(tmp_path):
+    class InvalidModel(FakeJsonModel):
+        def invoke(self, messages):
+            return SimpleNamespace(content="```json\nnot json\n```",
+                                   additional_kwargs={"reasoning_content": "测试推理", "api_key": "must-not-record"},
+                                   usage_metadata={"input_tokens": 10, "output_tokens": 3},
+                                   response_metadata={"finish_reason": "length", "headers": {"authorization": "must-not-record"}})
+
+    agent = InspectionAgent(tmp_path, metering_loader=lambda *_: metering_context(),
+                            equipment_loader=lambda *_: equipment_context(),
+                            result_db=tmp_path / "results.duckdb", model_client=InvalidModel(""))
+    report = agent.generate("metering", "u1", "2025-01-12")
+    path = tmp_path / "output/inspection_llm" / f"{report['llm_request_id']}.json"
+    text = path.read_text(encoding="utf-8")
+    record = json.loads(text)
+    assert record["status"] == "fallback"
+    assert record["failed_stage"] == "response_received"
+    assert record["output"]["content"] == "```json\nnot json\n```"
+    assert record["output"]["reasoning_content"] == "测试推理"
+    assert record["output"]["response_metadata"]["finish_reason"] == "length"
+    assert record["final_report"]["generator"] == "workflow-local-fallback"
+    assert "must-not-record" not in text
 
 
 def test_frontend_context_is_ignored_and_algorithm_values_are_immutable(tmp_path):

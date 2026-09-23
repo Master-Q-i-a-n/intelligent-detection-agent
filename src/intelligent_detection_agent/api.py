@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .conversation_api import create_conversation_router
+from .rag.api import create_rag_router
 from .daily_dashboard import DailyDiagnosisDashboard
 from .inspection_agent import InspectionAgent
 from .paths import PROJECT_ROOT
@@ -81,6 +82,7 @@ _refresh_parquet_views()
 app = FastAPI(title="燃气计量与设备健康智能检测平台", version="1.0.0")
 user_store = UserStore(USER_DB)
 app.include_router(create_conversation_router(ROOT, user_store))
+app.include_router(create_rag_router(ROOT))
 service = SmartMeteringService(use_deep_model=True)
 fast_service = SmartMeteringService(use_deep_model=False)
 daily_dashboard_service = DailyDiagnosisDashboard(ROOT)
@@ -391,19 +393,8 @@ def health():
 def users(limit: int = 1000, module: Optional[Literal["metering", "equipment"]] = None):
     """按业务模块返回可诊断企业；不传模块时保留原有交集口径。"""
     payload = _load_json(EQUIPMENT_INDEX)
-    equipment_items = {str(item["user_id"]): item for item in payload.get("users", [])}
-    with duckdb.connect(str(INPUT_DB), read_only=True) as con:
-        metering_rows = con.execute(
-            """
-            SELECT s.user_id, ANY_VALUE(u.station_name) AS station_name,
-                   MIN(s.data_date) AS start_date, MAX(s.data_date) AS end_date
-            FROM telemetry.scada_observation s
-            LEFT JOIN asset.user_meter u ON u.user_id=s.user_id
-            GROUP BY s.user_id
-            ORDER BY s.user_id
-            """
-        ).fetchall()
     bounded_limit = max(1, min(limit, 2000))
+    # 设备索引已包含企业与日期，直接返回，避免首屏重复扫描计量遥测数据。
     if module == "equipment":
         items = []
         for equipment in payload.get("users", []):
@@ -420,6 +411,18 @@ def users(limit: int = 1000, module: Optional[Literal["metering", "equipment"]] 
             "date_range": payload.get("date_range", []),
         }
 
+    equipment_items = {str(item["user_id"]): item for item in payload.get("users", [])}
+    with duckdb.connect(str(INPUT_DB), read_only=True) as con:
+        metering_rows = con.execute(
+            """
+            SELECT s.user_id, ANY_VALUE(u.station_name) AS station_name,
+                   MIN(s.data_date) AS start_date, MAX(s.data_date) AS end_date
+            FROM telemetry.scada_observation s
+            LEFT JOIN asset.user_meter u ON u.user_id=s.user_id
+            GROUP BY s.user_id
+            ORDER BY s.user_id
+            """
+        ).fetchall()
     items = []
     for user_id, station_name, start_date, end_date in metering_rows:
         equipment = equipment_items.get(str(user_id))

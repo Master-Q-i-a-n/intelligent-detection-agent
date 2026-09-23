@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import httpx
 from qdrant_client import QdrantClient, models
@@ -107,7 +107,7 @@ def load_records(records_path: Path) -> list[dict[str, Any]]:
 def stable_point_id(record: dict[str, Any]) -> str:
     """使用来源和 chunk_id 生成可重复 upsert 的 UUID。"""
 
-    key = f"{record['source']}::{record['chunk_id']}"
+    key = f"{record.get('document_id', record['source'])}::{record['chunk_id']}"
     return str(uuid.uuid5(POINT_NAMESPACE, key))
 
 
@@ -155,6 +155,7 @@ def build_payload(
     ]
     embed_text = str(record["embed_text"])
     return {
+        **({"document_id": record["document_id"]} if record.get("document_id") else {}),
         "chunk_id": str(record["chunk_id"]),
         "source": str(record["source"]),
         "text": str(record["text"]),
@@ -299,8 +300,10 @@ class RagPipeline:
         *,
         qdrant: QdrantClient | None = None,
         bailian: BailianClient | None = None,
+        root: Path = PROJECT_ROOT,
     ) -> None:
         self.config = config
+        self.root = root
         # 对 HTTP 自托管实例启用服务端 Document 推理；Dense 向量仍由百炼生成。
         self.qdrant = qdrant or QdrantClient(
             url=config.qdrant_url,
@@ -378,16 +381,31 @@ class RagPipeline:
         records_path: Path,
         *,
         recreate: bool = False,
+        document_id: str | None = None,
+        start_index: int = 0,
+        progress: Callable[[int], None] | None = None,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> int:
+        if document_id and recreate:
+            raise ValueError("文档增量入库不能重建整个 Collection")
+        if not document_id and (self.root / "database" / "rag_documents.db").exists():
+            raise RuntimeError("已启用知识库管理，请通过知识库页面添加文档；旧 index 命令仅用于未启用管理的独立库")
         records_path = records_path.resolve()
         records = load_records(records_path)
+        if not 0 <= start_index <= len(records):
+            raise ValueError("入库断点超出记录范围")
+        if document_id:
+            for record in records:
+                record["document_id"] = document_id
         document_root = records_path.parent.parent
         # 先校验远端模型凭据，再执行可能删除 Collection 的 --recreate。
         bailian = self._get_bailian()
         self.prepare_collection(recreate=recreate)
 
-        indexed = 0
-        for batch in batched(records, EMBEDDING_BATCH_SIZE):
+        indexed = start_index
+        for batch in batched(records[start_index:], EMBEDDING_BATCH_SIZE):
+            if check_cancelled:
+                check_cancelled()
             texts = [str(record["embed_text"]) for record in batch]
             vectors = bailian.embed(texts, text_type="document")
             points = []
@@ -413,6 +431,8 @@ class RagPipeline:
                 wait=True,
             )
             indexed += len(points)
+            if progress:
+                progress(indexed)
             print(f"已入库 {indexed}/{len(records)}")
         return indexed
 
@@ -427,6 +447,7 @@ class RagPipeline:
             using="dense",
             limit=limit,
             with_payload=True,
+            **self._visibility_kwargs(),
         ).points
 
     def _query_bm25(self, query: str, limit: int) -> list[Any]:
@@ -440,6 +461,7 @@ class RagPipeline:
             using="bm25",
             limit=limit,
             with_payload=True,
+            **self._visibility_kwargs(),
         ).points
 
     def _query_hybrid(
@@ -455,6 +477,7 @@ class RagPipeline:
                     query=vector,
                     using="dense",
                     limit=limit,
+                    filter=self._visibility_kwargs().get("query_filter"),
                 ),
                 models.Prefetch(
                     query=models.Document(
@@ -464,12 +487,24 @@ class RagPipeline:
                     ),
                     using="bm25",
                     limit=limit,
+                    filter=self._visibility_kwargs().get("query_filter"),
                 ),
             ],
             query=models.FusionQuery(fusion=models.Fusion.RRF),
             limit=limit,
             with_payload=True,
+            **self._visibility_kwargs(),
         ).points
+
+    def _visibility_kwargs(self) -> dict[str, Any]:
+        """登记目录存在后只检索 ready 文档；迁移期间也不会泄漏半成品。"""
+        from .documents import DocumentStore
+        if not (self.root / "database" / "rag_documents.db").exists():
+            return {}
+        ids = DocumentStore(self.root).ready_ids()
+        return {"query_filter": models.Filter(must=[models.FieldCondition(
+            key="document_id", match=models.MatchAny(any=ids or ["__no_ready_document__"])
+        )])}
 
     def search(
         self,
@@ -480,6 +515,11 @@ class RagPipeline:
     ) -> dict[str, Any]:
         if not original_query.strip():
             raise ValueError("查询问题不能为空。")
+        if (self.root / "database" / "rag_documents.db").exists():
+            from .documents import DocumentStore
+            if not DocumentStore(self.root).ready_ids():
+                return {"original_query": original_query, "retrieval_query": original_query.strip(),
+                        "collection": self.config.collection_name, "hybrid_candidates": [], "results": []}
         self.check_qdrant()
         if not self._collection_exists():
             raise RuntimeError(
@@ -528,6 +568,9 @@ class RagPipeline:
             str(item["payload"].get("embed_text", ""))
             for item in candidates
         ]
+        if not documents:
+            return {"original_query": original_query, "retrieval_query": retrieval_query,
+                    "collection": self.config.collection_name, "hybrid_candidates": [], "results": []}
         reranked = self._get_bailian().rerank(
             retrieval_query,
             documents,

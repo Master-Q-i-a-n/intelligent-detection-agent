@@ -1,15 +1,28 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api'
 import { Sidebar, Topbar } from './components/Layout'
 import type { AgentRecord, AutoAgentRequest } from './components/AgentControls'
 import { EmptyState, LoadingState } from './components/Common'
-import { EquipmentPage } from './pages/EquipmentPage'
-import { MeteringPage } from './pages/MeteringPage'
-import { OverviewPage } from './pages/OverviewPage'
-import { SafetyPage } from './pages/SafetyPage'
-import { ChatPage } from './pages/ChatPage'
 import { AuthPage } from './pages/AuthPage'
-import type { AuthUser, PageKey, SecurityEvent, SecurityOverview, UserSummary } from './types'
+import type { AuthUser, PageKey, SecurityEvent, SecurityOverview, UserListResponse } from './types'
+
+// 页面代码仅在进入对应模块时下载，登录和导航不再等待图表、问答等依赖。
+const pageLoaders = {
+  overview: () => import('./pages/OverviewPage').then((module) => ({ default: module.OverviewPage })),
+  metering: () => import('./pages/MeteringPage').then((module) => ({ default: module.MeteringPage })),
+  equipment: () => import('./pages/EquipmentPage').then((module) => ({ default: module.EquipmentPage })),
+  safety: () => import('./pages/SafetyPage').then((module) => ({ default: module.SafetyPage })),
+  chat: () => import('./pages/ChatPage').then((module) => ({ default: module.ChatPage })),
+  knowledge: () => import('./pages/KnowledgePage').then((module) => ({ default: module.KnowledgePage })),
+}
+const OverviewPage = lazy(pageLoaders.overview)
+const MeteringPage = lazy(pageLoaders.metering)
+const EquipmentPage = lazy(pageLoaders.equipment)
+const SafetyPage = lazy(pageLoaders.safety)
+const ChatPage = lazy(pageLoaders.chat)
+const KnowledgePage = lazy(pageLoaders.knowledge)
+
+type CatalogState = { data?: UserListResponse; error?: string }
 
 const AUTO_AGENT_STORAGE_KEY = 'yaoheng:auto-agent-enabled'
 
@@ -29,13 +42,9 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null)
   const [authChecking, setAuthChecking] = useState(true)
   const [page, setPage] = useState<PageKey>('overview')
-  const [meteringUsers, setMeteringUsers] = useState<UserSummary[]>([])
-  const [equipmentUsers, setEquipmentUsers] = useState<UserSummary[]>([])
-  const [globalRange, setGlobalRange] = useState<[string, string] | []>([])
-  const [userId, setUserId] = useState('')
-  const [date, setDate] = useState('')
-  const [initializing, setInitializing] = useState(true)
-  const [initialError, setInitialError] = useState('')
+  const [catalogs, setCatalogs] = useState<Partial<Record<'metering' | 'equipment', CatalogState>>>({})
+  const [storedUserId, setUserId] = useState('')
+  const [storedDate, setDate] = useState('')
   const [refreshToken, setRefreshToken] = useState(0)
   const [busy, setBusy] = useState(false)
   const [autoAgentEnabled, setAutoAgentEnabled] = useState(() => {
@@ -64,39 +73,48 @@ export default function App() {
 
   useEffect(() => {
     if (!currentUser) return
+    // 当前页代码与企业索引同时加载，避免先等数据再下载页面的串行等待。
+    void pageLoaders[page]().catch(() => undefined)
+  }, [currentUser, page])
+
+  useEffect(() => {
+    if (!currentUser) return
     const controller = new AbortController()
-    setInitializing(true)
-    Promise.all([
-      api.users('metering', controller.signal),
-      api.users('equipment', controller.signal),
-    ])
-      .then(([meteringResult, equipmentResult]) => {
-        const nextUsers = meteringResult.items || []
-        const firstUser = nextUsers[0]
-        const range = meteringResult.date_range.length ? meteringResult.date_range : equipmentResult.date_range
-        const initialDates = datesBetween(firstUser?.date_range || range)
-        setMeteringUsers(nextUsers)
-        setEquipmentUsers(equipmentResult.items || [])
-        setGlobalRange(range)
-        setUserId(firstUser?.user_id || '')
-        setDate(initialDates.at(-1) || '')
-        if (!initialDates.length) setInitialError('接口未返回有效检测日期，未发起任何无日期请求。')
-      })
-      .catch((reason: unknown) => {
-        if (!controller.signal.aborted) setInitialError(reason instanceof Error ? reason.message : '初始化失败')
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setInitializing(false)
-      })
+    setCatalogs({})
+    // 两份索引独立返回，慢请求或单模块故障不阻塞其他页面。
+    for (const module of ['metering', 'equipment'] as const) {
+      api.users(module, controller.signal)
+        .then((data) => {
+          if (!controller.signal.aborted) setCatalogs((current) => ({ ...current, [module]: { data } }))
+        })
+        .catch((reason: unknown) => {
+          if (!controller.signal.aborted) setCatalogs((current) => ({
+            ...current, [module]: { error: reason instanceof Error ? reason.message : '初始化失败' },
+          }))
+        })
+    }
     return () => controller.abort()
   }, [currentUser])
 
+  const meteringUsers = useMemo(() => catalogs.metering?.data?.items || [], [catalogs.metering])
+  const equipmentUsers = useMemo(() => catalogs.equipment?.data?.items || [], [catalogs.equipment])
+  // 总览优先使用计量日期；计量没有日期或加载失败时，才等待设备索引兜底。
+  const overviewCatalog = catalogs.metering?.data?.date_range.length ? catalogs.metering : catalogs.equipment
+  const globalRange = overviewCatalog?.data?.date_range || []
+  const selectedCatalog = page === 'overview' ? (catalogs.metering ? overviewCatalog : undefined)
+    : catalogs[page === 'equipment' ? 'equipment' : 'metering']
+  const needsCatalog = page === 'overview' || page === 'metering' || page === 'equipment'
+  const initializing = needsCatalog && !selectedCatalog
+  const initialError = selectedCatalog?.error || '接口未返回有效检测日期，未发起任何无日期请求。'
   const users = page === 'equipment' ? equipmentUsers : meteringUsers
-  const selectedUser = useMemo(() => users.find((user) => user.user_id === userId), [userId, users])
+  const selectedUser = useMemo(() => users.find((user) => user.user_id === storedUserId) || users[0], [storedUserId, users])
+  const userId = selectedUser?.user_id || ''
   const dates = useMemo(
-    () => datesBetween(page === 'metering' || page === 'equipment' ? (selectedUser?.date_range || globalRange) : globalRange),
-    [globalRange, page, selectedUser],
+    () => datesBetween(page === 'metering' || page === 'equipment'
+      ? (selectedUser?.date_range || selectedCatalog?.data?.date_range) : selectedCatalog?.data?.date_range),
+    [page, selectedCatalog, selectedUser],
   )
+  const date = dates.includes(storedDate) ? storedDate : (dates.at(-1) || '')
   const activeAgentKey = page === 'metering' || page === 'equipment' ? `${page}:${userId}:${date}` : ''
 
   const changeUser = useCallback((nextUserId: string) => {
@@ -192,16 +210,18 @@ export default function App() {
       return
     }
     let active = true
+    const controller = new AbortController()
+    let timer: number | undefined
     async function pollSecurity() {
       try {
-        const overview = await api.securityOverview()
+        const overview = await api.securityOverview(controller.signal)
         if (!active) return
         setSecurityOverviewState(overview)
         if (securitySequence.current === null) {
           securitySequence.current = overview.latest_sequence
           return
         }
-        const result = await api.securityEvents({ after_sequence: securitySequence.current, limit: 20 })
+        const result = await api.securityEvents({ after_sequence: securitySequence.current, limit: 20 }, controller.signal)
         if (!active) return
         if (result.items.length) {
           securitySequence.current = Math.max(...result.items.map((item) => item.notification_sequence), securitySequence.current)
@@ -210,13 +230,16 @@ export default function App() {
         }
       } catch {
         // 轮询失败会在下一周期自动恢复，不重复弹出全局错误。
+      } finally {
+        // 请求完成后再计时，避免服务慢时每五秒叠加一批请求。
+        if (active) timer = window.setTimeout(pollSecurity, 5_000)
       }
     }
     void pollSecurity()
-    const timer = window.setInterval(pollSecurity, 5_000)
     return () => {
       active = false
-      window.clearInterval(timer)
+      controller.abort()
+      window.clearTimeout(timer)
     }
   }, [currentUser])
 
@@ -236,8 +259,9 @@ export default function App() {
     } finally {
       setCurrentUser(null)
       setAgentRecords({})
-      setMeteringUsers([])
-      setEquipmentUsers([])
+      setCatalogs({})
+      setUserId('')
+      setDate('')
       setPage('overview')
       setSecurityToast(null)
     }
@@ -248,7 +272,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <Sidebar page={page} onPageChange={changePage} autoAgentEnabled={autoAgentEnabled} onAutoAgentChange={changeAutoAgent} safetyBadge={securityOverviewState?.new_count || 0} currentUser={currentUser} onLogout={() => void logout()} />
-      {!currentUser ? <AuthPage onAuthenticated={setCurrentUser} /> : initializing ? <div className="boot-screen"><LoadingState label="正在建立数据链路" /></div> : <main className="main-shell">
+      {!currentUser ? <AuthPage onAuthenticated={setCurrentUser} /> : <main className="main-shell">
         <Topbar
           page={page}
           users={users}
@@ -261,16 +285,17 @@ export default function App() {
           onRefresh={() => setRefreshToken((value) => value + 1)}
         />
         <div className="content-shell">
-          {initialError && !date && page !== 'safety' && page !== 'chat' ? (
+          {initializing ? <LoadingState label="正在加载检测企业与日期" /> : !date && needsCatalog ? (
             <EmptyState title="无法进入检测流程" detail={initialError} />
           ) : (
-            <>
+            <Suspense fallback={<LoadingState label="正在加载页面" />}>
               {page === 'overview' && <OverviewPage active date={date} refreshToken={refreshToken} onBusyChange={setBusy} onOpenIssue={openIssue} />}
               {page === 'metering' && <MeteringPage active userId={userId} date={date} refreshToken={refreshToken} autoAgentEnabled={autoAgentEnabled} autoRecord={agentRecords[activeAgentKey]} onAutoRequest={requestAutoAgent} onBusyChange={setBusy} />}
               {page === 'equipment' && <EquipmentPage active userId={userId} date={date} refreshToken={refreshToken} autoAgentEnabled={autoAgentEnabled} autoRecord={agentRecords[activeAgentKey]} onAutoRequest={requestAutoAgent} onBusyChange={setBusy} />}
               {page === 'safety' && <SafetyPage refreshToken={refreshToken} liveSequence={securityOverviewState?.latest_sequence || 0} onBusyChange={setBusy} onChanged={refreshSecurityOverview} username={currentUser.username} />}
               {page === 'chat' && <ChatPage />}
-            </>
+              {page === 'knowledge' && <KnowledgePage />}
+            </Suspense>
           )}
         </div>
       </main>}

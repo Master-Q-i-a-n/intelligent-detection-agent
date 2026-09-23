@@ -292,6 +292,10 @@ uv run python -m intelligent_detection_agent.safety_operations.notifier `
 
 计量和设备解读使用两个独立的 LangGraph `StateGraph`。后端按企业和日期读取可信诊断结果，再根据风险走不同的固定分支；LLM只负责原因排序、支持/反向证据分析、证据缺口和核查建议，不执行代码，也不能修改算法数值与状态。通过结构校验的报告按“诊断内容 + 模型 + 工作流版本 + 现场补充信息”生成指纹，复用结果保存在 `database/gas_ai_results.duckdb` 的 `inspection.workflow_report` 表中。
 
+诊断解读每次实际调用会将输入输出记录到 `output/inspection_llm/<request_id>.json`（该目录已被 Git 忽略）。记录包含实际传入模型的 system/user 消息、白名单生成参数、解析前的原始正文、返回的 `reasoning_content`（若有）、Token 用量、结束原因、解析结果及最终报告；不保存客户端配置、API Key 或请求头。这是模型调用层记录，不是原始 HTTP 报文。响应中的推理仅供本地排查，不展示到页面，也不改变 SFT 导出规则。
+
+报告的 `llm_request_id` 对应该文件名，`report_id` 用于关联业务报告。命中缓存不发起模型调用，也不新增记录；旧缓存不会补出历史原始响应。请求前和响应解析前都会保存快照，解析失败仍保留响应并记录回退状态；服务异常终止时可能只留下未完成快照。文件写入失败会写服务端错误日志，并在当次报告增加 `llm_recording_notice`。这些文件包含完整业务输入及现场信息，仅存本地，按需要自行清理。
+
 ## LangSmith
 
 LangSmith 默认关闭。需要追踪时在 `.env` 设置：
@@ -351,7 +355,55 @@ npm --prefix frontend run test:e2e
 
 ## RAG 技术文档检索
 
+### 知识库页面
+
+登录后进入侧栏“知识库”，上传 PDF 即可自动完成“解析页面 → 识别图片 → 整理内容 → 建立索引”。
+支持全文或一个连续页码范围，页码按 PDF 实际页序从 1 开始，包含起止页；同一文件不同范围独立管理。
+相同文件内容与相同范围不会重复入库。默认单文件上限 100 MiB。
+
+图片通过 `deepseek-v4-flash-vision-exp` 单图调用，**全局最多50个并发请求**，可用
+`RAG_VISION_CONCURRENCY` 在 1–50 之间调整。每张图附带其关联文本，描述不超过200字。
+识别结果逐图缓存；失败时显示原因与失败图片，点击“重试”继续，未完成条目不会被检索。
+删除立即将条目移出检索，后台等待在途任务停止后清理该条目的 dense、BM25 和文件；失败自动重试。
+历史回答中的文字不会被改写，已删除来源的文件返回404。
+
+Docling 仍运行在独立 Python 环境，主环境无需安装 Docling 或升级 Torch：
+
+```dotenv
+RAG_DOCLING_PYTHON=E:\MyWork\Agent\docling\.venv\Scripts\python.exe
+RAG_VISION_MODEL=deepseek-v4-flash-vision-exp
+RAG_VISION_CONCURRENCY=50
+RAG_UPLOAD_MAX_MB=100
+```
+
+识图密钥、地址可分别用 `RAG_VISION_API_KEY`、`RAG_VISION_BASE_URL` 配置；留空沿用通用配置。
+Docling 环境必须已安装 `docling-slim` 所需的解析、RapidOCR、分块组件以及本地模型缓存。
+未指定解释器时查找项目同级 `docling/.venv/Scripts/python.exe`；页面会提示解释器不存在。
+扫描件、损坏文本层或出现 `Gxx` 编码文字的 PDF 请开启“强制 OCR”。
+
+任务保存在 `database/rag_documents.db`，原文和中间结果保存在 `dataset/doc/doc_<id>/`。
+后台 worker 随 API 启停，使用操作系统文件锁避免多个 API 进程重复处理；刷新页面不会停止任务。
+服务重启从上次完成阶段继续，入库阶段从成功批次恢复；更改模型配置需重启后端。
+第一次运行自动登记当前 Collection 中的旧文档并补充 `document_id`，不重跑识图和 Embedding。
+迁移期间新检索只访问已登记完成的文档；旧文档没有保存原 PDF 时仍能检索，但原文入口不可用。
+第一版知识库由所有登录用户共享管理，不提供已有条目的页码编辑；需要修改时删除后重新上传。
+
+显式执行单页真实验证（会调用视觉、Embedding 和 Rerank API）：
+
+```powershell
+uv run python scripts/rag_document_smoke.py `
+  --pdf 'E:\path\to\manual.pdf' --start 7 --end 7 --force-ocr `
+  --query '该页图示说明什么？'
+```
+
+验证使用独立 Collection，完成后清理测试索引，并在 `output/rag_smoke/<id>/report.json` 保存结果。
+管理 API 为 `/rag/documents`（添加、列表）和 `/rag/documents/{id}`（详情、删除），
+失败恢复使用 `POST /rag/documents/{id}/retry`；均要求登录。
+
 RAG 已作为 `search_technical_documents` 工具接入多轮问答，也可以通过命令行独立验证。数据源默认读取：
+
+下面的 `index --recreate` 仅适用于尚未启用知识库管理的独立库；启用管理后请通过页面增删文档，
+防止绕过文档登记或误删其他文档。`query`、`demo` 和检索评测仍可使用。
 
 ```text
 dataset/doc/用气体超声流量计测量天然气流量/ingest/records.json

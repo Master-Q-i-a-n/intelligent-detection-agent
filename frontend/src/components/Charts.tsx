@@ -1,4 +1,5 @@
-import ReactECharts from 'echarts-for-react'
+import { Suspense } from 'react'
+import { LazyECharts } from './LazyECharts'
 import type { EChartsOption, LineSeriesOption } from 'echarts'
 
 const chartText = '#7f9aac'
@@ -25,13 +26,15 @@ export function Chart({ option, height = 280, empty = false, emptyText = '暂无
   }
   return (
     <div role="img" aria-label={ariaLabel} className="chart-frame" style={{ height }}>
-      <ReactECharts
+      <Suspense fallback={<div className="chart-empty" role="status" style={{ height }}>正在加载图表</div>}>
+      <LazyECharts
         option={option}
         notMerge
         lazyUpdate
         style={{ width: '100%', height: '100%' }}
         opts={{ renderer: 'canvas' }}
       />
+      </Suspense>
     </div>
   )
 }
